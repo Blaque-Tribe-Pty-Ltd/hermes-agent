@@ -232,6 +232,14 @@ _SNAPSHOTS: tuple[tuple[str, Optional[str], str, dict], ...] = (
     }),
     ("minimax", None, "minimax-pricing-2026-04", {"minimax-m2.7": ("0.30", "1.20")}),
     ("minimax-cn", None, "minimax-pricing-2026-04", {"minimax-m2.7": ("0.30", "1.20")}),
+    # Kimi / Moonshot: K2.6 and K2.7-Code rates match Fireworks serverless list price.
+    # Runtime model ID is `kimi-k2.6` (dot); snapshot key uses `kimi-k2p6` (p) for Fireworks
+    # compat, aliased below. Cache read rate is per Kimi published docs.
+    ("kimi", "https://platform.moonshot.ai/docs/pricing", "kimi-pricing-2026-09-24", {
+        "kimi-k2p6": ("0.95", "4.00", "0.16"), "kimi-k2p7-code": ("0.95", "4.00", "0.19"),
+        ("kimi-k2p6-fast", "kimi-k2p6-turbo"): ("2.00", "8.00", "0.30"),
+        "kimi-k2p7-code-fast": ("1.90", "8.00", "0.38"),
+    }),
     # Fireworks AI serverless (Standard tier) publishes a per-model cached_input
     # rate (→ cache_read) but no separate cache_write rate. Fast/turbo tiers are
     # exposed as accounts/fireworks/routers/<name>, so rsplit("/", 1) yields
@@ -327,7 +335,15 @@ for _provider, _alias, _canonical in (
     ("google", "gemini-3.1-flash-lite-preview", "gemini-3.1-flash-lite"),
 ):
     _OFFICIAL_DOCS_PRICING[(_provider, _alias)] = _OFFICIAL_DOCS_PRICING[(_provider, _canonical)]
-del _provider, _alias, _canonical
+# Kimi runtime model ID uses dot notation (`kimi-k2.6`) while snapshot keys use
+# `p` notation (`kimi-k2p6`) for Fireworks compatibility. Alias both forms.
+for _kimimodel in ("kimi-k2p6", "kimi-k2p7-code", "kimi-k2p6-fast", "kimi-k2p6-turbo", "kimi-k2p7-code-fast"):
+    _dotalias = _kimimodel.replace("k2p", "k2.")
+    _OFFICIAL_DOCS_PRICING[("kimi", _dotalias)] = _OFFICIAL_DOCS_PRICING[("kimi", _kimimodel)]
+    # Also alias under fireworks provider so shared routes resolve
+    if ("fireworks", _kimimodel) in _OFFICIAL_DOCS_PRICING:
+        _OFFICIAL_DOCS_PRICING[("fireworks", _dotalias)] = _OFFICIAL_DOCS_PRICING[("fireworks", _kimimodel)]
+del _provider, _alias, _canonical, _kimimodel, _dotalias
 
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
@@ -361,6 +377,7 @@ def _first_nonzero(obj: Any, *paths: tuple[str, ...]) -> int:
 # api.openai.com). Google and Fireworks are matched by name OR host below.
 _SNAPSHOT_PROVIDER_ALIASES = {
     "anthropic": "anthropic", "openai": "openai", "openai-api": "openai", "minimax": "minimax", "minimax-cn": "minimax-cn",
+    "kimi": "kimi", "kimi-coding": "kimi", "moonshot": "kimi",
 }
 # AI Studio and Vertex host the same Gemini models (the Vertex "google/" vendor
 # prefix is stripped with the rest of the path).
