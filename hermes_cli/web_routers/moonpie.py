@@ -48,16 +48,34 @@ async def _get_agent() -> Optional[Any]:
             return _agent_instance
         try:
             from run_agent import AIAgent
+            from hermes_cli.config import load_config_readonly
 
             def _init():
                 with _config_profile_scope(None):
+                    cfg = load_config_readonly()
+                    model_cfg = cfg.get("model", {})
+                    provider = model_cfg.get("provider", "kimi") if isinstance(model_cfg, dict) else "kimi"
+                    model = model_cfg.get("default", "kimi-k2.6") if isinstance(model_cfg, dict) else "kimi-k2.6"
+                    fb = cfg.get("fallback_providers", {})
+                    fallback_model = None
+                    if isinstance(fb, dict) and fb:
+                        first = next(iter(fb.values()))
+                        if isinstance(first, dict) and first.get("provider") and first.get("model"):
+                            fallback_model = dict(first)
+                    _log.info("MoonPie agent creating with provider=%s model=%s fallback=%s",
+                              provider, model, fallback_model)
                     return AIAgent(
                         platform="moonpie",
                         quiet_mode=True,
+                        provider=provider,
+                        model=model,
+                        fallback_model=fallback_model,
                     )
 
             _agent_instance = await asyncio.to_thread(_init)
-            _log.info("MoonPie agent initialized")
+            _log.info("MoonPie agent initialized: provider=%s model=%s",
+                      getattr(_agent_instance, "provider", "?"),
+                      getattr(_agent_instance, "model", "?"))
         except Exception as exc:
             _log.warning("MoonPie agent init failed: %s", exc, exc_info=True)
             _agent_instance = None

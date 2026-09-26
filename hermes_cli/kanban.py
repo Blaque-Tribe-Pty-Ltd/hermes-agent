@@ -64,22 +64,28 @@ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict
 
 
 def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``.
-    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch."""
+    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``, ``project:<id>``.
+    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch.
+    ``project:<id>`` stores a logical workspace identifier that is resolved to a host path at
+    execution time via ``workspace_resolver.py``. This prevents tasks created on one host from
+    carrying foreign paths to another host's dispatcher."""
     if not value:
         return (None, None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
-    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree")):
+    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree"), ("project:", "worktree")):
         if not v.startswith(prefix):
             continue
         path = v[len(prefix):].strip()
         if not path:
-            raise argparse.ArgumentTypeError(f"--workspace {prefix} requires a path after the colon")
+            raise argparse.ArgumentTypeError(f"--workspace {prefix} requires a value after the colon")
+        if prefix == "project:":
+            # Logical workspace identifier: resolved at execution time.
+            return (kind, f"__project__:{path}")
         return (kind, os.path.expanduser(path))
     raise argparse.ArgumentTypeError(f"unknown --workspace value {value!r}: use scratch, worktree, "
-                                     "worktree:<path>, or dir:<path>")
+                                     "worktree:<path>, dir:<path>, or project:<id>")
 
 
 def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
