@@ -364,21 +364,21 @@ async def moonpie_websocket(websocket: WebSocket):
     if token:
         device_id = _device_tokens.get(token)
 
-    # Fallback: accept any non-empty token as a generic device for now
-    # (TODO: remove once full device registration flow is implemented)
+    # Fallbacks during development: accept any token, and allow guest when absent
+    # (TODO: tighten once full device registration flow is implemented)
     if not device_id and token:
         device_id = f"fallback-{token[:8]}"
+    if not device_id and not token:
+        device_id = f"guest-{uuid.uuid4().hex[:8]}"
 
-    # If no query token, wait for auth.login message
+    # If still no device id, wait once for an auth.login message
     if not device_id:
         try:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
             data = json.loads(msg)
             if data.get("method") == "auth.login":
                 token = data.get("params", {}).get("device_token", "")
-                device_id = _device_tokens.get(token)
-                if not device_id and token:
-                    device_id = f"fallback-{token[:8]}"
+                device_id = _device_tokens.get(token) or (f"fallback-{token[:8]}" if token else None)
         except asyncio.TimeoutError:
             await websocket.close(code=4001, reason="Authentication timeout")
             return
