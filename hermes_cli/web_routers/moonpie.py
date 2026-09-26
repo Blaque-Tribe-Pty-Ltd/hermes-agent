@@ -534,12 +534,23 @@ async def _send_tts_audio(conn: _MoonPieConnection, text: str):
         result_json = await asyncio.to_thread(_synthesize)
         result = json.loads(result_json) if isinstance(result_json, str) else result_json
         if not result.get("success"):
-            _log.warning("MoonPie TTS synthesis failed: %s", result.get("error"))
+            error_msg = result.get("error") or "TTS synthesis failed"
+            _log.warning("MoonPie TTS synthesis failed: %s", error_msg)
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "tts.status",
+                "params": {"available": False, "reason": error_msg},
+            })
             return
 
         file_path = result.get("file_path")
         if not file_path or not os.path.isfile(file_path):
             _log.warning("MoonPie TTS audio file missing: %s", file_path)
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "tts.status",
+                "params": {"available": False, "reason": "Audio file missing"},
+            })
             return
 
         def _read_and_unlink() -> bytes:
@@ -554,9 +565,19 @@ async def _send_tts_audio(conn: _MoonPieConnection, text: str):
 
         audio_bytes = await asyncio.to_thread(_read_and_unlink)
         await conn.websocket.send_bytes(audio_bytes)
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "method": "tts.status",
+            "params": {"available": True},
+        })
         _log.debug("MoonPie sent TTS audio: %d bytes to %s", len(audio_bytes), conn.device_id)
-    except Exception:
+    except Exception as exc:
         _log.warning("MoonPie TTS audio send failed", exc_info=True)
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "method": "tts.status",
+            "params": {"available": False, "reason": str(exc)},
+        })
 
 
 # ---------------------------------------------------------------------------
