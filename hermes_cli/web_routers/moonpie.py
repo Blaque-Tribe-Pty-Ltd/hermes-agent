@@ -487,12 +487,25 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             try:
                 final_response = await asyncio.to_thread(_run_chat)
 
+                # If the model didn't stream deltas, send one full delta now so the
+                # client has content to render before the complete notification.
+                if final_response and not accumulated:
+                    await conn.send_json({
+                        "jsonrpc": "2.0",
+                        "method": "conversation.delta",
+                        "params": {
+                            "content": final_response,
+                            "conversation_id": conversation_id,
+                        },
+                    })
+
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "method": "conversation.complete",
                     "params": {"conversation_id": conversation_id},
                 })
 
+                # Provide a JSON-RPC result for request/response clients (ignored by MoonPie UI)
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "id": req_id,
