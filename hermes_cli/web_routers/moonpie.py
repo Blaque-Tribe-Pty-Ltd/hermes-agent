@@ -413,15 +413,34 @@ async def moonpie_websocket(websocket: WebSocket):
 
 
 async def _moonpie_loop(conn: _MoonPieConnection):
-    """Read JSON-RPC requests from the client and dispatch them."""
+    """Read JSON-RPC requests from the client and dispatch them.
+
+    Accepts both text and binary JSON frames so native clients can send
+    ``URLSessionWebSocketTask.Message.data`` without special-casing.
+    """
     while True:
         try:
-            text = await conn.websocket.receive_text()
+            event = await conn.websocket.receive()
         except WebSocketDisconnect:
             break
 
+        if event.get("type") == "websocket.disconnect":
+            break
+
+        if "text" in event and event["text"] is not None:
+            raw = event["text"]
+        elif "bytes" in event and event["bytes"] is not None:
+            try:
+                raw = event["bytes"].decode("utf-8", errors="ignore")
+            except Exception:
+                await conn.send_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Invalid binary payload"}})
+                continue
+        else:
+            # Ignore control/noop frames
+            continue
+
         try:
-            data = json.loads(text)
+            data = json.loads(raw)
         except json.JSONDecodeError:
             await conn.send_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
             continue
