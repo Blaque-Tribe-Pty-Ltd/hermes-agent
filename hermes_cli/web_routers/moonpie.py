@@ -394,6 +394,16 @@ async def moonpie_websocket(websocket: WebSocket):
     _moonpie_connections[device_id] = conn
     _log.info("MoonPie WebSocket connected: %s", device_id)
 
+    # Send an immediate ready notification so native clients mark the
+    # connection as established without waiting for the first delta.
+    await conn.send_json({
+        "jsonrpc": "2.0",
+        "method": "connection.ready",
+        "params": {
+            "device_id": device_id,
+        },
+    })
+
     try:
         await _moonpie_loop(conn)
     except WebSocketDisconnect:
