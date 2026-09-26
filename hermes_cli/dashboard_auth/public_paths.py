@@ -24,4 +24,8 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Chronos managed-cron fire webhook (NAS -> agent). NOT cookie-gated: it
     # carries its own short-lived NAS-minted JWT (purpose=cron_fire), which the
     # handler verifies — the JWT, not this allowlist, is the security boundary.
-    "/api/cron/fire"})
+    "/api/cron/fire",
+    # MoonPie macOS client WebSocket. Auth is handled inside the handler via
+    # device_token query param + auth.login message; no dashboard session needed.
+    "/api/moonpie/ws",
+})

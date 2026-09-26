@@ -2386,9 +2386,42 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             middleware_trace=list(middleware_trace),
         )
-        return block_message, (modified_args if modified_args is not None else function_args)
+        if block_message is not None:
+            return block_message, (modified_args if modified_args is not None else function_args)
     except Exception:
-        return None, function_args
+        pass
+
+    # Specialist ownership gate: if the current task is specialist-owned and has
+    # no valid result, MoonPie may not perform the specialist work directly.
+    # Orchestration tools (delegate, clarify, memory, search, diagnostics) are
+    # allowed so MoonPie can dispatch, monitor, escalate, and synthesize.
+    _ORCHESTRATION_TOOLS = {
+        "delegate_task", "clarify", "memory", "skill_view", "skill_manage",
+        "web_search", "web_extract", "terminal", "hermes",
+    }
+    if function_name not in _ORCHESTRATION_TOOLS:
+        # Determine task identity from explicit metadata, not naming convention.
+        _task_id = None
+        # 1) effective_task_id if it looks like a Kanban task ID
+        if effective_task_id:
+            _task_id = effective_task_id
+        # 2) Agent's own tracked task context
+        if not _task_id and agent is not None:
+            _task_id = getattr(agent, "_current_task_id", None)
+        # 3) Environment variable for Kanban workers
+        if not _task_id:
+            import os as _os
+            _task_id = _os.environ.get("HERMES_KANBAN_TASK", "").strip() or None
+        if _task_id:
+            try:
+                from hermes_cli.kanban_delegate_bridge import assert_specialist_result_exists
+                assert_specialist_result_exists(_task_id)
+            except RuntimeError as exc:
+                return str(exc), function_args
+            except Exception:
+                pass
+
+    return None, function_args
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,

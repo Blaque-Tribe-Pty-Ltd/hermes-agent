@@ -48,16 +48,34 @@ async def _get_agent() -> Optional[Any]:
             return _agent_instance
         try:
             from run_agent import AIAgent
+            from hermes_cli.config import load_config_readonly
 
             def _init():
                 with _config_profile_scope(None):
+                    cfg = load_config_readonly()
+                    model_cfg = cfg.get("model", {})
+                    provider = model_cfg.get("provider", "kimi") if isinstance(model_cfg, dict) else "kimi"
+                    model = model_cfg.get("default", "kimi-k2.6") if isinstance(model_cfg, dict) else "kimi-k2.6"
+                    fb = cfg.get("fallback_providers", {})
+                    fallback_model = None
+                    if isinstance(fb, dict) and fb:
+                        first = next(iter(fb.values()))
+                        if isinstance(first, dict) and first.get("provider") and first.get("model"):
+                            fallback_model = dict(first)
+                    _log.info("MoonPie agent creating with provider=%s model=%s fallback=%s",
+                              provider, model, fallback_model)
                     return AIAgent(
                         platform="moonpie",
                         quiet_mode=True,
+                        provider=provider,
+                        model=model,
+                        fallback_model=fallback_model,
                     )
 
             _agent_instance = await asyncio.to_thread(_init)
-            _log.info("MoonPie agent initialized")
+            _log.info("MoonPie agent initialized: provider=%s model=%s",
+                      getattr(_agent_instance, "provider", "?"),
+                      getattr(_agent_instance, "model", "?"))
         except Exception as exc:
             _log.warning("MoonPie agent init failed: %s", exc, exc_info=True)
             _agent_instance = None
@@ -364,21 +382,21 @@ async def moonpie_websocket(websocket: WebSocket):
     if token:
         device_id = _device_tokens.get(token)
 
-    # Fallback: accept any non-empty token as a generic device for now
-    # (TODO: remove once full device registration flow is implemented)
+    # Fallbacks during development: accept any token, and allow guest when absent
+    # (TODO: tighten once full device registration flow is implemented)
     if not device_id and token:
         device_id = f"fallback-{token[:8]}"
+    if not device_id and not token:
+        device_id = f"guest-{uuid.uuid4().hex[:8]}"
 
-    # If no query token, wait for auth.login message
+    # If still no device id, wait once for an auth.login message
     if not device_id:
         try:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
             data = json.loads(msg)
             if data.get("method") == "auth.login":
                 token = data.get("params", {}).get("device_token", "")
-                device_id = _device_tokens.get(token)
-                if not device_id and token:
-                    device_id = f"fallback-{token[:8]}"
+                device_id = _device_tokens.get(token) or (f"fallback-{token[:8]}" if token else None)
         except asyncio.TimeoutError:
             await websocket.close(code=4001, reason="Authentication timeout")
             return
@@ -394,6 +412,16 @@ async def moonpie_websocket(websocket: WebSocket):
     _moonpie_connections[device_id] = conn
     _log.info("MoonPie WebSocket connected: %s", device_id)
 
+    # Send an immediate ready notification so native clients mark the
+    # connection as established without waiting for the first delta.
+    await conn.send_json({
+        "jsonrpc": "2.0",
+        "method": "connection.ready",
+        "params": {
+            "device_id": device_id,
+        },
+    })
+
     try:
         await _moonpie_loop(conn)
     except WebSocketDisconnect:
@@ -403,15 +431,34 @@ async def moonpie_websocket(websocket: WebSocket):
 
 
 async def _moonpie_loop(conn: _MoonPieConnection):
-    """Read JSON-RPC requests from the client and dispatch them."""
+    """Read JSON-RPC requests from the client and dispatch them.
+
+    Accepts both text and binary JSON frames so native clients can send
+    ``URLSessionWebSocketTask.Message.data`` without special-casing.
+    """
     while True:
         try:
-            text = await conn.websocket.receive_text()
+            event = await conn.websocket.receive()
         except WebSocketDisconnect:
             break
 
+        if event.get("type") == "websocket.disconnect":
+            break
+
+        if "text" in event and event["text"] is not None:
+            raw = event["text"]
+        elif "bytes" in event and event["bytes"] is not None:
+            try:
+                raw = event["bytes"].decode("utf-8", errors="ignore")
+            except Exception:
+                await conn.send_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Invalid binary payload"}})
+                continue
+        else:
+            # Ignore control/noop frames
+            continue
+
         try:
-            data = json.loads(text)
+            data = json.loads(raw)
         except json.JSONDecodeError:
             await conn.send_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
             continue
@@ -458,12 +505,25 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             try:
                 final_response = await asyncio.to_thread(_run_chat)
 
+                # If the model didn't stream deltas, send one full delta now so the
+                # client has content to render before the complete notification.
+                if final_response and not accumulated:
+                    await conn.send_json({
+                        "jsonrpc": "2.0",
+                        "method": "conversation.delta",
+                        "params": {
+                            "content": final_response,
+                            "conversation_id": conversation_id,
+                        },
+                    })
+
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "method": "conversation.complete",
                     "params": {"conversation_id": conversation_id},
                 })
 
+                # Provide a JSON-RPC result for request/response clients (ignored by MoonPie UI)
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "id": req_id,
