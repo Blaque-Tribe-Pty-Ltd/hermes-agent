@@ -62,14 +62,15 @@ _STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
     rf'</(?:{_NS_PREFIX}(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function))>\s*', re.IGNORECASE
 )
 
-# A tool-call opener with no closer, or GLM-style argument markup
-# (<arg_key>/<arg_value>) outside any closed block, means the stream was
-# cut mid-serialization of a text-channel tool call (#101899). The call
-# can't be recovered; strip from the block-boundary opener (or the line
-# holding the first stray argument tag) to the end of the text.
+# An unclosed tool call is unrecoverable (#101899), so drop its remaining block.
+# Stray argument tags only identify fragment lines, not the rest of the text
+# (#102303). Require a line-start tag (optionally glued to a bare tool name,
+# process_manage<arg_key>) or a line-ending closer (wait</arg_value>) so inline
+# prose mentions and subsequent prose survive.
 _UNTERMINATED_TOOL_CALL_PATTERN = re.compile(
     rf'(?:^|\n)[ \t]*<{_NS_PREFIX}(?:{"|".join(_TOOL_CALL_TAG_NAMES)})\b[^>]*>.*$'
-    r'|(?:^|\n)[^\n<]*</?arg_(?:key|value)\b.*$',
+    r'|(?:^|\n)[ \t]*[\w.:-]*</?arg_(?:key|value)\b[^\n]*'
+    r'|(?:^|\n)[^\n<]*</arg_(?:key|value)>[ \t\r]*(?=\n|$)',
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -447,6 +448,27 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
         prev.pop(_DB_PERSISTED_MARKER, None)
 
 
+def _remember_absorbed_row(survivor: Dict[str, Any], dropped: Dict[str, Any]) -> None:
+    """Record durable ids a merge folded into *survivor* and then dropped from the list.
+
+    No-op when the dropped dict names no row. An empty incoming turn still merges,
+    and stamping an empty list would change a message that absorbed nothing.
+    """
+    ids = []
+    row_id = dropped.get("_row_id")
+    if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0:
+        ids.append(row_id)
+    for older in dropped.get("_absorbed_row_ids") or ():
+        if isinstance(older, int) and not isinstance(older, bool) and older > 0 and older not in ids:
+            ids.append(older)
+    if not ids:
+        return
+    absorbed = survivor.setdefault("_absorbed_row_ids", [])
+    for row_id in ids:
+        if row_id not in absorbed:
+            absorbed.append(row_id)
+
+
 def _merge_consecutive_assistants(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 0: merge consecutive assistant turns (codex interims exempt)."""
     repairs = 0
@@ -460,9 +482,11 @@ def _merge_consecutive_assistants(messages: List[Dict]) -> Tuple[List[Dict], int
         ):
             # A provisional verification candidate is superseded, not unioned.
             if prev.get("finish_reason") in {"verification_required", "verify_hook_continue"}:
+                _remember_absorbed_row(msg, prev)
                 collapsed[-1] = msg
             else:
                 _merge_assistant_into(prev, msg)
+                _remember_absorbed_row(prev, msg)
             repairs += 1
             continue
         collapsed.append(msg)
@@ -582,6 +606,7 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             # reproduces the persisted bytes (e.g. an empty incoming turn) keeps its stamp.
             if merged_content != prev_content or had_api_sidecar:
                 prev.pop(_DB_PERSISTED_MARKER, None)
+            _remember_absorbed_row(prev, msg)
             repairs += 1
             continue
         merged.append(msg)
@@ -1238,10 +1263,13 @@ def restore_primary_runtime(agent) -> bool:
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
     primary_model = str((rt or {}).get("model") or "").strip()
     from agent.fallback_cooldown import _is_entitlement_rejected
-    if primary_model and _is_entitlement_rejected(agent, primary_provider, primary_model):
-        # The primary slug was rejected as unentitled for this account (#106475): restoring
-        # here would announce a recovery that was never verified and re-fail every turn.
-        # Stay on the fallback; the user sees the terminal entitlement error instead.
+    from hermes_cli.chat_catalog import is_known_non_chat_model
+    if primary_model and (
+        _is_entitlement_rejected(agent, primary_provider, primary_model)
+        or is_known_non_chat_model(primary_model)
+    ):
+        # Unentitled (#106475) or already known non-chat: restoring would announce a recovery
+        # that was never verified and re-fail every turn. Stay on the fallback.
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
 
@@ -1334,11 +1362,11 @@ _INLINE_REASONING_PATTERNS = tuple(
 def extract_reasoning(agent, assistant_message) -> Optional[str]:
     """Reasoning text from ``reasoning`` / ``reasoning_content`` / ``reasoning_details``
     (OpenRouter unified), else inline thinking blocks in the content; None when absent."""
+    from agent.message_content import flatten_message_text
+
     parts: List[str] = []
 
     def _add(text) -> None:
-        from agent.message_content import flatten_message_text
-
         text = flatten_message_text(text, sep="")
         if text and text not in parts:
             parts.append(text)
@@ -1356,7 +1384,10 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         # Refs #21944.
         for block in content:
             if isinstance(block, dict) and block.get("type") == "thinking":
-                _add((block.get("thinking") or block.get("text") or "").strip())
+                # Non-strict OpenAI-compatible backends (Mistral via custom provider)
+                # deliver the thinking value as a JSON array, not a string (#106006);
+                # flatten first so .strip() never sees a list.
+                _add(flatten_message_text(block.get("thinking") or block.get("text") or "", sep="").strip())
     if not parts and isinstance(content, str) and content:
         for pattern in _INLINE_REASONING_PATTERNS:
             for block in pattern.findall(content):
@@ -2355,9 +2386,42 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
             middleware_trace=list(middleware_trace),
         )
-        return block_message, (modified_args if modified_args is not None else function_args)
+        if block_message is not None:
+            return block_message, (modified_args if modified_args is not None else function_args)
     except Exception:
-        return None, function_args
+        pass
+
+    # Specialist ownership gate: if the current task is specialist-owned and has
+    # no valid result, MoonPie may not perform the specialist work directly.
+    # Orchestration tools (delegate, clarify, memory, search, diagnostics) are
+    # allowed so MoonPie can dispatch, monitor, escalate, and synthesize.
+    _ORCHESTRATION_TOOLS = {
+        "delegate_task", "clarify", "memory", "skill_view", "skill_manage",
+        "web_search", "web_extract", "terminal", "hermes",
+    }
+    if function_name not in _ORCHESTRATION_TOOLS:
+        # Determine task identity from explicit metadata, not naming convention.
+        _task_id = None
+        # 1) effective_task_id if it looks like a Kanban task ID
+        if effective_task_id:
+            _task_id = effective_task_id
+        # 2) Agent's own tracked task context
+        if not _task_id and agent is not None:
+            _task_id = getattr(agent, "_current_task_id", None)
+        # 3) Environment variable for Kanban workers
+        if not _task_id:
+            import os as _os
+            _task_id = _os.environ.get("HERMES_KANBAN_TASK", "").strip() or None
+        if _task_id:
+            try:
+                from hermes_cli.kanban_delegate_bridge import assert_specialist_result_exists
+                assert_specialist_result_exists(_task_id)
+            except RuntimeError as exc:
+                return str(exc), function_args
+            except Exception:
+                pass
+
+    return None, function_args
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,

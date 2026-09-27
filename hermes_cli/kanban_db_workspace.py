@@ -495,7 +495,13 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             )
         return _anchored_worktree(repo_root, task.id, branch_name)
 
-    requested = Path(task.workspace_path).expanduser()
+    # Cross-platform workspace resolution: rewrite foreign host paths
+    # (e.g. macOS /Users/... on a Linux dispatcher) to local equivalents.
+    from hermes_cli.workspace_resolver import resolve_worktree_path
+    resolved_path_str = resolve_worktree_path(
+        task.workspace_path, task_id=task.id
+    )
+    requested = Path(resolved_path_str).expanduser()
     if not requested.is_absolute():
         raise ValueError(
             f"task {task.id} has non-absolute worktree path "
@@ -533,6 +539,11 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             "and does not point at a git repo root"
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
+    # Validate and repair the worktree before handing it to a worker.
+    # This catches stale branches, detached checkouts, and cross-platform
+    # path drift that _ensure_git_worktree alone does not detect.
+    from hermes_cli.worktree_lifecycle import repair_worktree
+    repair_worktree(requested, repo_root=repo_root, branch_name=branch_name)
     return requested, branch_name
 
 

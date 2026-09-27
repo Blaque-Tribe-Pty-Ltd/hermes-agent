@@ -2156,6 +2156,16 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    # Completion reconciliation: detect workers that exited cleanly but
+    # produced output without calling kanban_complete. Auto-complete them
+    # so the dependency chain can advance.
+    try:
+        from hermes_cli.kanban_completion_reconciliation import reconcile_unreported_completions
+        auto_completed = reconcile_unreported_completions(conn, board=board)
+        if auto_completed:
+            result.promoted += _kb.recompute_ready(conn, failure_limit=failure_limit)
+    except Exception as exc:
+        _kb._log.debug("kanban reconciliation: completion reconciliation failed: %s", exc)
 
 
 def _tick_spawn_budget(
@@ -2956,6 +2966,56 @@ def run_daemon(
                     on_tick(res)
         except Exception:
             # Don't let any single tick kill the daemon.
+            import traceback
+            traceback.print_exc()
+        stop_event.wait(timeout=interval)
+
+
+def run_reconciliation_loop(
+    *,
+    interval: float = 15.0,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    stop_event=None,
+    on_tick=None,
+) -> None:
+    """Run a lightweight reconciliation loop alongside the main dispatcher.
+
+    This is a SEPARATE loop from ``run_daemon`` so stale running state is
+    corrected more frequently than the 60-second dispatch interval.
+    Reclaims crashed workers, enforces max runtime, and reconciles
+    unreported completions every ``interval`` seconds.
+
+    Typical usage:
+        threading.Thread(target=run_daemon, daemon=True).start()
+        threading.Thread(target=run_reconciliation_loop, daemon=True).start()
+    """
+    import threading
+
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    while not stop_event.is_set():
+        try:
+            auto_completed: list[str] = []
+            with contextlib.closing(_kbc.connect()) as conn:
+                reap_worker_zombies()
+                reap_terminal_workers(conn)
+                _kb.release_stale_claims(conn, failure_limit=failure_limit)
+                detect_stale_running(conn, stale_timeout_seconds=300)
+                detect_crashed_workers(conn)
+                enforce_max_runtime(conn)
+                try:
+                    from hermes_cli.kanban_completion_reconciliation import reconcile_unreported_completions
+                    auto_completed = reconcile_unreported_completions(conn)
+                    if auto_completed:
+                        _kb.recompute_ready(conn, failure_limit=failure_limit)
+                except Exception as exc:
+                    _kb._log.debug("kanban reconciliation loop: %s", exc)
+                _kb.recompute_ready(conn, failure_limit=failure_limit)
+            if on_tick is not None:
+                with contextlib.suppress(Exception):
+                    on_tick({"auto_completed": auto_completed})
+        except Exception:
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)

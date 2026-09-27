@@ -12,15 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from hermes_cli.web_routers._common import http_failure, require
+from hermes_cli.web_routers._common import http_failure, require, _config_profile_scope
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter(prefix="/api/moonpie")
@@ -31,12 +31,15 @@ router = APIRouter(prefix="/api/moonpie")
 
 _agent_instance: Optional[Any] = None
 _agent_lock = asyncio.Lock()
-_agent_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="moonpie_agent")
 _device_histories: Dict[str, List[Dict[str, Any]]] = {}
 
 
 async def _get_agent() -> Optional[Any]:
-    """Lazily initialize a shared AIAgent for MoonPie clients."""
+    """Lazily initialize a shared AIAgent for MoonPie clients.
+
+    Runs inside ``_config_profile_scope`` so the agent resolves credentials,
+    model, and memory from the active Hermes profile.
+    """
     global _agent_instance
     if _agent_instance is not None:
         return _agent_instance
@@ -45,14 +48,36 @@ async def _get_agent() -> Optional[Any]:
             return _agent_instance
         try:
             from run_agent import AIAgent
-            _agent_instance = AIAgent(
-                platform="moonpie",
-                quiet_mode=True,
-                skip_memory=True,
-            )
-            _log.info("MoonPie agent initialized")
+            from hermes_cli.config import load_config_readonly
+
+            def _init():
+                with _config_profile_scope(None):
+                    cfg = load_config_readonly()
+                    model_cfg = cfg.get("model", {})
+                    provider = model_cfg.get("provider", "kimi") if isinstance(model_cfg, dict) else "kimi"
+                    model = model_cfg.get("default", "kimi-k2.6") if isinstance(model_cfg, dict) else "kimi-k2.6"
+                    fb = cfg.get("fallback_providers", {})
+                    fallback_model = None
+                    if isinstance(fb, dict) and fb:
+                        first = next(iter(fb.values()))
+                        if isinstance(first, dict) and first.get("provider") and first.get("model"):
+                            fallback_model = dict(first)
+                    _log.info("MoonPie agent creating with provider=%s model=%s fallback=%s",
+                              provider, model, fallback_model)
+                    return AIAgent(
+                        platform="moonpie",
+                        quiet_mode=True,
+                        provider=provider,
+                        model=model,
+                        fallback_model=fallback_model,
+                    )
+
+            _agent_instance = await asyncio.to_thread(_init)
+            _log.info("MoonPie agent initialized: provider=%s model=%s",
+                      getattr(_agent_instance, "provider", "?"),
+                      getattr(_agent_instance, "model", "?"))
         except Exception as exc:
-            _log.warning("MoonPie agent init failed: %s", exc)
+            _log.warning("MoonPie agent init failed: %s", exc, exc_info=True)
             _agent_instance = None
     return _agent_instance
 
@@ -357,14 +382,21 @@ async def moonpie_websocket(websocket: WebSocket):
     if token:
         device_id = _device_tokens.get(token)
 
-    # If no query token, wait for auth.login message
+    # Fallbacks during development: accept any token, and allow guest when absent
+    # (TODO: tighten once full device registration flow is implemented)
+    if not device_id and token:
+        device_id = f"fallback-{token[:8]}"
+    if not device_id and not token:
+        device_id = f"guest-{uuid.uuid4().hex[:8]}"
+
+    # If still no device id, wait once for an auth.login message
     if not device_id:
         try:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
             data = json.loads(msg)
             if data.get("method") == "auth.login":
                 token = data.get("params", {}).get("device_token", "")
-                device_id = _device_tokens.get(token)
+                device_id = _device_tokens.get(token) or (f"fallback-{token[:8]}" if token else None)
         except asyncio.TimeoutError:
             await websocket.close(code=4001, reason="Authentication timeout")
             return
@@ -380,6 +412,16 @@ async def moonpie_websocket(websocket: WebSocket):
     _moonpie_connections[device_id] = conn
     _log.info("MoonPie WebSocket connected: %s", device_id)
 
+    # Send an immediate ready notification so native clients mark the
+    # connection as established without waiting for the first delta.
+    await conn.send_json({
+        "jsonrpc": "2.0",
+        "method": "connection.ready",
+        "params": {
+            "device_id": device_id,
+        },
+    })
+
     try:
         await _moonpie_loop(conn)
     except WebSocketDisconnect:
@@ -389,15 +431,34 @@ async def moonpie_websocket(websocket: WebSocket):
 
 
 async def _moonpie_loop(conn: _MoonPieConnection):
-    """Read JSON-RPC requests from the client and dispatch them."""
+    """Read JSON-RPC requests from the client and dispatch them.
+
+    Accepts both text and binary JSON frames so native clients can send
+    ``URLSessionWebSocketTask.Message.data`` without special-casing.
+    """
     while True:
         try:
-            text = await conn.websocket.receive_text()
+            event = await conn.websocket.receive()
         except WebSocketDisconnect:
             break
 
+        if event.get("type") == "websocket.disconnect":
+            break
+
+        if "text" in event and event["text"] is not None:
+            raw = event["text"]
+        elif "bytes" in event and event["bytes"] is not None:
+            try:
+                raw = event["bytes"].decode("utf-8", errors="ignore")
+            except Exception:
+                await conn.send_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Invalid binary payload"}})
+                continue
+        else:
+            # Ignore control/noop frames
+            continue
+
         try:
-            data = json.loads(text)
+            data = json.loads(raw)
         except json.JSONDecodeError:
             await conn.send_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Parse error"}})
             continue
@@ -407,56 +468,71 @@ async def _moonpie_loop(conn: _MoonPieConnection):
         params = data.get("params", {})
 
         if method == "conversation.message":
-            content = params.get("content", "")
+            payload = params.get("payload", {})
+            content = payload.get("text", params.get("content", ""))
+            conversation_id = params.get("conversation_id", "")
             agent = await _get_agent()
 
             if agent is None:
-                # Agent not available — graceful fallback to echo
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"status": "complete", "content": f"Echo: {content}"},
+                    "error": {"code": -32000, "message": "Agent not available"},
                 })
                 continue
 
-            # Maintain per-device conversation history
-            history = _device_histories.get(conn.device_id, [])
+            loop = asyncio.get_running_loop()
+            accumulated = []
 
-            loop = asyncio.get_event_loop()
-
-            def _run_agent():
-                return agent.run_conversation(
-                    user_message=content,
-                    conversation_history=history,
-                    task_id=f"moonpie-{conn.device_id}",
+            def stream_callback(delta: str):
+                accumulated.append(delta)
+                asyncio.run_coroutine_threadsafe(
+                    conn.send_json({
+                        "jsonrpc": "2.0",
+                        "method": "conversation.delta",
+                        "params": {
+                            "content": delta,
+                            "conversation_id": conversation_id,
+                        },
+                    }),
+                    loop,
                 )
 
+            def _run_chat():
+                with _config_profile_scope(None):
+                    return agent.chat(content, stream_callback=stream_callback)
+
             try:
-                result = await loop.run_in_executor(_agent_executor, _run_agent)
-                response = result.get("final_response", "") if result else ""
+                final_response = await asyncio.to_thread(_run_chat)
 
-                # Update history for next turn
-                _device_histories[conn.device_id] = result.get("messages", history)
-
-                # Stream-style delivery for real-time UI feel
-                if response:
+                # If the model didn't stream deltas, send one full delta now so the
+                # client has content to render before the complete notification.
+                if final_response and not accumulated:
                     await conn.send_json({
                         "jsonrpc": "2.0",
                         "method": "conversation.delta",
-                        "params": {"content": response},
+                        "params": {
+                            "content": final_response,
+                            "conversation_id": conversation_id,
+                        },
                     })
+
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "method": "conversation.complete",
-                    "params": {},
+                    "params": {"conversation_id": conversation_id},
                 })
 
-                # JSON-RPC request/response compatibility
+                # Provide a JSON-RPC result for request/response clients (ignored by MoonPie UI)
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "id": req_id,
-                    "result": {"status": "complete", "content": response},
+                    "result": {"status": "complete", "content": final_response},
                 })
+
+                # Stream TTS audio as binary frames after text completes
+                await _send_tts_audio(conn, final_response)
+
             except Exception as exc:
                 _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
                 await conn.send_json({
@@ -474,15 +550,17 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             })
 
         elif method == "approval.respond":
-            # TODO: Forward to the active agent session
+            approval_id = params.get("approval_id", "")
+            action = params.get("action", "")
+            _log.info("MoonPie approval response: %s action=%s from %s", approval_id, action, conn.device_id)
+            # TODO: Route to the active kanban approval queue
             await conn.send_json({
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {"status": "received"},
+                "result": {"status": "received", "approval_id": approval_id},
             })
 
         elif method == "device.capabilities":
-            # TODO: Enumerate local workspaces via Workspace Bridge / MCP
             await conn.send_json({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -501,6 +579,65 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Method not found: {method}"},
             })
+
+
+async def _send_tts_audio(conn: _MoonPieConnection, text: str):
+    """Synthesize speech for ``text`` and send it as a binary WebSocket frame."""
+    if not text:
+        return
+    try:
+        def _synthesize():
+            with _config_profile_scope(None):
+                from tools.tts_tool import text_to_speech_tool
+                return text_to_speech_tool(text)
+
+        result_json = await asyncio.to_thread(_synthesize)
+        result = json.loads(result_json) if isinstance(result_json, str) else result_json
+        if not result.get("success"):
+            error_msg = result.get("error") or "TTS synthesis failed"
+            _log.warning("MoonPie TTS synthesis failed: %s", error_msg)
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "tts.status",
+                "params": {"available": False, "reason": error_msg},
+            })
+            return
+
+        file_path = result.get("file_path")
+        if not file_path or not os.path.isfile(file_path):
+            _log.warning("MoonPie TTS audio file missing: %s", file_path)
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "tts.status",
+                "params": {"available": False, "reason": "Audio file missing"},
+            })
+            return
+
+        def _read_and_unlink() -> bytes:
+            try:
+                with open(file_path, "rb") as fh:
+                    return fh.read()
+            finally:
+                try:
+                    os.unlink(file_path)
+                except OSError:
+                    pass
+
+        audio_bytes = await asyncio.to_thread(_read_and_unlink)
+        await conn.websocket.send_bytes(audio_bytes)
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "method": "tts.status",
+            "params": {"available": True},
+        })
+        _log.debug("MoonPie sent TTS audio: %d bytes to %s", len(audio_bytes), conn.device_id)
+    except Exception as exc:
+        _log.warning("MoonPie TTS audio send failed", exc_info=True)
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "method": "tts.status",
+            "params": {"available": False, "reason": str(exc)},
+        })
 
 
 # ---------------------------------------------------------------------------

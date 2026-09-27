@@ -325,6 +325,21 @@ def _run_single_child(
         owner_session_record=owner_session_record,
     )
     run = _ChildRun(child, parent_agent, task_index, goal, _subagent_id, child_progress_cb, heartbeat=heartbeat)
+    # Kanban bridge: record specialist dispatch attempt
+    _kanban_task_id = getattr(child, "_kanban_task_id", None)
+    if _kanban_task_id and _kanban_task_id != "__standalone__":
+        try:
+            from hermes_cli.kanban_delegate_bridge import record_delegate_dispatch
+            record_delegate_dispatch(
+                _kanban_task_id,
+                subagent_session_id=str(getattr(child, "session_id", _subagent_id or "unknown")),
+                profile=str(getattr(child, "profile", "unknown")),
+                goal=goal,
+            )
+        except Exception:
+            logger.debug("kanban dispatch record failed for task %s", _kanban_task_id, exc_info=True)
+    elif _kanban_task_id == "__standalone__":
+        logger.info("delegate_task: standalone delegation (no Kanban task context)")
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
@@ -334,6 +349,16 @@ def _run_single_child(
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
+            # Kanban bridge: record specialist dispatch failure
+            if _kanban_task_id:
+                try:
+                    from hermes_cli.kanban_delegate_bridge import block_task_on_dispatch_failure
+                    block_task_on_dispatch_failure(
+                        _kanban_task_id,
+                        reason=f"delegate_task failure: {failure_entry.get('error', 'unknown')}",
+                    )
+                except Exception:
+                    logger.debug("kanban failure record failed for task %s", _kanban_task_id, exc_info=True)
             return failure_entry
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)
@@ -348,11 +373,33 @@ def _run_single_child(
         run.append_sibling_write_reminder(entry)
         run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
+        # Kanban bridge: record specialist completion
+        if _kanban_task_id:
+            try:
+                from hermes_cli.kanban_delegate_bridge import record_delegate_completion
+                record_delegate_completion(
+                    _kanban_task_id,
+                    subagent_session_id=str(getattr(child, "session_id", _subagent_id or "unknown")),
+                    outcome=entry.get("status", "completed"),
+                    summary=entry.get("summary", "")[:200],
+                )
+            except Exception:
+                logger.debug("kanban completion record failed for task %s", _kanban_task_id, exc_info=True)
         return run.attach_worktree(entry)
     except Exception as exc:
         # Close steer acceptance before any completion callback (see _merge_late_steer).
         _late_pending_steer = run.close_steering()
         logging.exception(f"[subagent-{task_index}] failed")
+        # Kanban bridge: record specialist dispatch failure
+        if _kanban_task_id:
+            try:
+                from hermes_cli.kanban_delegate_bridge import block_task_on_dispatch_failure
+                block_task_on_dispatch_failure(
+                    _kanban_task_id,
+                    reason=f"delegate_task exception: {exc}",
+                )
+            except Exception:
+                logger.debug("kanban failure record failed for task %s", _kanban_task_id, exc_info=True)
         # Entry status "error" (contract), progress event status "failed" (UI vocabulary).
         return run.finish_failed(
             _fabricated_entry(task_index, "error", str(exc), child, run.elapsed()), _late_pending_steer,
@@ -413,6 +460,21 @@ def _build_children(
             _ident_ref = getattr(child, "_progress_identity_ref", None)
             if isinstance(_ident_ref, dict):
                 _ident_ref["delegation_id"] = live_deleg_id
+        # Bridge Kanban task identity into the child so delegate_task can log
+        # dispatch/completion/failure back to the canonical task store.
+        # Priority: 1) explicit kanban_task_id in task dict, 2) HERMES_KANBAN_TASK env,
+        # 3) parent agent's _current_task_id. If none found, record as standalone.
+        _kanban_task_id = t.get("kanban_task_id")
+        if not _kanban_task_id:
+            import os as _os
+            _kanban_task_id = _os.environ.get("HERMES_KANBAN_TASK", "").strip() or None
+        if not _kanban_task_id and parent_agent is not None:
+            _kanban_task_id = getattr(parent_agent, "_current_task_id", None)
+        if _kanban_task_id:
+            setattr(child, "_kanban_task_id", _kanban_task_id)
+        else:
+            # Explicitly mark as standalone so observability is not lost
+            setattr(child, "_kanban_task_id", "__standalone__")
         children.append((i, t, child))
     return children, None
 
