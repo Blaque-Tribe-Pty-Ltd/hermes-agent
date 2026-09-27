@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import threading
 import time
@@ -1676,7 +1677,29 @@ def run_kanban_goal_loop(
 
         if verdict == "done":
             if nudged_to_finalize:
-                # Already asked once to call kanban_complete — block for review rather than spin.
+                # Worker was judged done but did not call kanban_complete after the nudge.
+                # Instead of blocking immediately, check if the worker produced tangible
+                # output. If so, auto-complete to keep the pipeline moving. Only block
+                # when there is no evidence of completed work.
+                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; checking output")
+                try:
+                    from hermes_cli.kanban_completion_reconciliation import _worker_produced_output
+                    from hermes_cli import kanban_db as _kb
+                    db_path = _kb.kanban_db_path()
+                    with sqlite3.connect(str(db_path)) as _conn:
+                        task = _kb.get_task(_conn, task_id)
+                        workspace = task.workspace_path if task else None
+                        if workspace and _worker_produced_output(workspace):
+                            _log(f"kanban goal loop: task {task_id} auto-completing (output detected)")
+                            _kb.complete_task(
+                                _conn, task_id,
+                                result=f"Auto-completed: judge ruled done and worker output was detected in {workspace}. "
+                                       f"Original judge reason: {reason}",
+                            )
+                            return _result("completed_auto", "judged done, output detected, auto-completed")
+                except Exception as exc:
+                    _log(f"kanban goal loop: auto-complete check failed for {task_id}: {exc}")
+                # No output or check failed — block for review.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
                 _block(
                     f"Goal-mode worker's output looked complete but it never "

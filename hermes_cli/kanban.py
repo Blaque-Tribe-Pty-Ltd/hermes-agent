@@ -64,22 +64,28 @@ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict
 
 
 def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
-    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``.
-    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch."""
+    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``, ``project:<id>``.
+    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch.
+    ``project:<id>`` stores a logical workspace identifier that is resolved to a host path at
+    execution time via ``workspace_resolver.py``. This prevents tasks created on one host from
+    carrying foreign paths to another host's dispatcher."""
     if not value:
         return (None, None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
-    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree")):
+    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree"), ("project:", "worktree")):
         if not v.startswith(prefix):
             continue
         path = v[len(prefix):].strip()
         if not path:
-            raise argparse.ArgumentTypeError(f"--workspace {prefix} requires a path after the colon")
+            raise argparse.ArgumentTypeError(f"--workspace {prefix} requires a value after the colon")
+        if prefix == "project:":
+            # Logical workspace identifier: resolved at execution time.
+            return (kind, f"__project__:{path}")
         return (kind, os.path.expanduser(path))
     raise argparse.ArgumentTypeError(f"unknown --workspace value {value!r}: use scratch, worktree, "
-                                     "worktree:<path>, or dir:<path>")
+                                     "worktree:<path>, dir:<path>, or project:<id>")
 
 
 def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
@@ -340,7 +346,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err("kanban: --body and --body-file are mutually exclusive", 2)
     if body_file is not None:
         try:
-            body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8")
+            body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
 
@@ -1371,9 +1377,20 @@ def run_slash(rest: str) -> str:
     stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
     import io
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
-    # Bare ``/kanban`` / ``help`` / ``-h``: curated short block, not argparse's full tree (garbage
-    # in a chat bubble). ``/kanban foo -h`` still works.
+    # Non-posix split (Windows) keeps backslashes as path separators but
+    # leaves quote characters in the tokens — strip a fully wrapping pair
+    # so `"my task"` reaches argparse as `my task`, not `"my task"`.
+    tokens = []
+    if rest and rest.strip():
+        for tok in shlex.split(rest, posix=os.name == "posix"):
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+                tok = tok[1:-1]
+            tokens.append(tok)
+
+    # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
+    # show the curated short-help block instead of dumping argparse's full
+    # usage tree (which is enormous and reads as garbage in a chat
+    # bubble).  Per-subcommand help still works via ``/kanban foo -h``.
     if not tokens or tokens[0] in {"help", "--help", "-h", "?"}:
         return _SLASH_KANBAN_HELP
     # build_parser() needs a subparsers action to attach to: build a throwaway one and drive

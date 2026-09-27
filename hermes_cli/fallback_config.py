@@ -75,7 +75,16 @@ def pre_agent_fallback_notice(
 
 
 def _iter_fallback_entries(raw: Any) -> list[dict[str, Any]]:
-    candidates = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+    candidates: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        candidates = raw
+    elif isinstance(raw, dict):
+        # Detect dict-of-dicts format: {"0": {"provider": "..."}, "1": {...}}
+        # vs single-entry dict: {"provider": "...", "model": "..."}
+        if raw and all(isinstance(v, dict) for v in raw.values()):
+            candidates = list(raw.values())
+        else:
+            candidates = [raw]
     entries: list[dict[str, Any]] = []
     for entry in candidates:
         if not isinstance(entry, dict):
