@@ -1053,12 +1053,18 @@ def _client_kwargs_from_routed(client, timeout) -> Dict[str, Any]:
 
 def _fallback_entries(fallback_model) -> List[Dict[str, Any]]:
     """Normalize legacy single-dict ``fallback_model`` / list ``fallback_providers``."""
-    if isinstance(fallback_model, dict):
-        fallback_model = [fallback_model]
-    if not isinstance(fallback_model, list):
-        return []
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(fallback_model, list):
+        candidates = fallback_model
+    elif isinstance(fallback_model, dict):
+        # Detect dict-of-dicts format: {"0": {"provider": "..."}, "1": {...}}
+        # vs single-entry dict: {"provider": "...", "model": "..."}
+        if fallback_model and all(isinstance(v, dict) for v in fallback_model.values()):
+            candidates = list(fallback_model.values())
+        else:
+            candidates = [fallback_model]
     return [
-        f for f in fallback_model if isinstance(f, dict) and f.get("provider") and f.get("model")
+        f for f in candidates if isinstance(f, dict) and f.get("provider") and f.get("model")
     ]
 
 

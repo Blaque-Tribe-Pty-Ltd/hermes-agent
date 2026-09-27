@@ -1,7 +1,7 @@
 """Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key, _iter_fallback_entries, get_fallback_chain
 
 
 class TestResolveEntryApiKey:
@@ -65,3 +65,93 @@ class TestEffectiveRuntimeProvider:
 
     def test_none_inputs_are_safe(self):
         assert effective_runtime_provider(None, None) == ""
+
+
+class TestIterFallbackEntries:
+    """Dict-of-dicts config format (e.g. YAML parsed with string indices) must flatten correctly."""
+
+    def test_list_format(self):
+        raw = [{"provider": "openai-api", "model": "gpt-4o"}]
+        assert _iter_fallback_entries(raw) == [{"provider": "openai-api", "model": "gpt-4o"}]
+
+    def test_single_dict_format(self):
+        raw = {"provider": "openai-api", "model": "gpt-4o"}
+        assert _iter_fallback_entries(raw) == [{"provider": "openai-api", "model": "gpt-4o"}]
+
+    def test_dict_of_dicts_format(self):
+        raw = {"0": {"provider": "openai-api", "model": "gpt-4o"}}
+        assert _iter_fallback_entries(raw) == [{"provider": "openai-api", "model": "gpt-4o"}]
+
+    def test_dict_of_dicts_multiple_entries(self):
+        raw = {
+            "0": {"provider": "openai-api", "model": "gpt-4o"},
+            "1": {"provider": "anthropic", "model": "claude-3"},
+        }
+        entries = _iter_fallback_entries(raw)
+        assert len(entries) == 2
+        assert entries[0] == {"provider": "openai-api", "model": "gpt-4o"}
+        assert entries[1] == {"provider": "anthropic", "model": "claude-3"}
+
+    def test_empty_dict(self):
+        assert _iter_fallback_entries({}) == []
+
+    def test_none(self):
+        assert _iter_fallback_entries(None) == []
+
+    def test_invalid_entries_filtered(self):
+        raw = [
+            {"provider": "openai-api", "model": "gpt-4o"},
+            {"provider": ""},  # missing model
+            {"model": "gpt-4"},  # missing provider
+            "not-a-dict",
+        ]
+        entries = _iter_fallback_entries(raw)
+        assert len(entries) == 1
+        assert entries[0] == {"provider": "openai-api", "model": "gpt-4o"}
+
+    def test_mixed_dict_of_dicts_with_invalid(self):
+        raw = {
+            "0": {"provider": "openai-api", "model": "gpt-4o"},
+            "1": {"provider": ""},  # invalid, filtered
+        }
+        entries = _iter_fallback_entries(raw)
+        assert len(entries) == 1
+        assert entries[0] == {"provider": "openai-api", "model": "gpt-4o"}
+
+
+class TestGetFallbackChain:
+    def test_dict_of_dicts_fallback_providers(self):
+        config = {
+            "fallback_providers": {
+                "0": {"provider": "openai-api", "model": "gpt-4o"}
+            }
+        }
+        chain = get_fallback_chain(config)
+        assert len(chain) == 1
+        assert chain[0] == {"provider": "openai-api", "model": "gpt-4o"}
+
+    def test_merges_fallback_providers_and_fallback_model(self):
+        config = {
+            "fallback_providers": {
+                "0": {"provider": "openai-api", "model": "gpt-4o"}
+            },
+            "fallback_model": {"provider": "anthropic", "model": "claude-3"},
+        }
+        chain = get_fallback_chain(config)
+        assert len(chain) == 2
+        assert chain[0] == {"provider": "openai-api", "model": "gpt-4o"}
+        assert chain[1] == {"provider": "anthropic", "model": "claude-3"}
+
+    def test_deduplicates_entries(self):
+        config = {
+            "fallback_providers": [
+                {"provider": "openai-api", "model": "gpt-4o"}
+            ],
+            "fallback_model": {"provider": "openai-api", "model": "gpt-4o"},
+        }
+        chain = get_fallback_chain(config)
+        assert len(chain) == 1
+
+    def test_empty_config(self):
+        assert get_fallback_chain({}) == []
+        assert get_fallback_chain(None) == []
