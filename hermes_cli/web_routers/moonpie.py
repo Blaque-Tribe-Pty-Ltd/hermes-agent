@@ -640,6 +640,9 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     content,
                     stream_callback=stream_callback,
                     tool_event_callback=tool_event_callback,
+                    device_id=conn.device_id or "",
+                    conversation_id=conversation_id,
+                    session_key=conn.session_key,
                 )
 
                 # If the model didn't stream deltas, send one full delta now so the
@@ -694,6 +697,46 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             finally:
                 if session_tokens:
                     clear_session_vars(session_tokens)
+
+        elif method == "conversation.cancel":
+            conversation_id = params.get("conversation_id", "")
+            cancel_result = _moonpie_adapter.cancel_turn(
+                conn.device_id or "", conversation_id
+            )
+
+            # Emit approval.withdrawn for each withdrawn approval
+            for req_id in cancel_result.get("withdrawn_approvals", []):
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "method": "approval.withdrawn",
+                    "params": {
+                        "approval_id": req_id,
+                        "conversation_id": conversation_id,
+                    },
+                })
+
+            # Emit conversation.complete with finish_reason if cancelled
+            if cancel_result["cancelled"]:
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "method": "conversation.complete",
+                    "params": {
+                        "conversation_id": conversation_id,
+                        "finish_reason": "cancelled",
+                    },
+                })
+
+            # Return JSON-RPC result
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "cancelled": cancel_result["cancelled"],
+                    "not_found": cancel_result["not_found"],
+                    "already_complete": cancel_result["already_complete"],
+                    "withdrawn_approvals": cancel_result.get("withdrawn_approvals", []),
+                },
+            })
 
         elif method == "conversation.start":
             conv_id = f"conv-{uuid.uuid4().hex[:12]}"

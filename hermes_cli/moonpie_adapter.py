@@ -24,27 +24,42 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from typing import Any, Callable, Optional
 
 _log = logging.getLogger("hermes_cli.moonpie_adapter")
 
 
+class _TurnState:
+    """Per-device turn state for cancellation tracking (Gate 6, B5)."""
+
+    __slots__ = ("device_id", "conversation_id", "session_key",
+                 "cancelled_event", "pending_approvals", "completed")
+
+    def __init__(self, device_id: str, conversation_id: str, session_key: str) -> None:
+        self.device_id = device_id
+        self.conversation_id = conversation_id
+        self.session_key = session_key
+        self.cancelled_event = threading.Event()
+        self.pending_approvals: set[str] = set()
+        self.completed = False
+
+
 class MoonPieHermesAdapter:
     """Minimal adapter isolating Hermes agent interaction from MoonPie router.
 
-    Current responsibilities (Gate 2, B3 only):
+    Current responsibilities:
     - Lazy initialisation of a shared ``AIAgent`` for MoonPie clients.
     - ``chat()`` — send a message, stream text deltas, return final response.
     - ``synthesize_speech()`` — synthesise speech audio, return raw bytes.
-
-    Non-goals for this gate:
-    - Approval bridging, kanban wiring, session management, persistence.
-    - These belong to later gates (B4, B5+) and the Application Services layer.
+    - ``cancel_turn()`` — signal cancellation, withdraw approvals, stop streaming (Gate 6, B5).
     """
 
     def __init__(self) -> None:
         self._agent: Optional[Any] = None
         self._lock = asyncio.Lock()
+        self._turn_lock = threading.Lock()
+        self._active_turns: dict[str, _TurnState] = {}
 
     # ------------------------------------------------------------------
     # Public interface (Hermes-agnostic upward-facing)
@@ -55,6 +70,10 @@ class MoonPieHermesAdapter:
         content: str,
         stream_callback: Callable[[str], None],
         tool_event_callback: Callable[[str, dict], None] | None = None,
+        *,
+        device_id: str = "",
+        conversation_id: str = "",
+        session_key: str = "",
     ) -> str:
         """Send *content* to the agent and stream deltas via *stream_callback*.
 
@@ -63,10 +82,25 @@ class MoonPieHermesAdapter:
 
         Returns the final response string.  Raises ``RuntimeError`` if the
         agent is not available.
+
+        Gate 6: Cancellation is tracked per device.  If ``cancel_turn`` is called
+        while this chat is in flight, subsequent deltas and tool events are dropped
+        and the turn returns early.
         """
         agent = await self._get_agent(tool_event_callback=tool_event_callback)
         if agent is None:
             raise RuntimeError("Agent not available")
+
+        # Register turn for cancellation tracking
+        turn = _TurnState(device_id, conversation_id, session_key)
+        with self._turn_lock:
+            self._active_turns[device_id] = turn
+
+        # Wrap stream_callback so cancellation drops deltas atomically
+        def _wrapped_stream(part: str) -> None:
+            if turn.cancelled_event.is_set():
+                return
+            stream_callback(part)
 
         def _run() -> str:
             # _config_profile_scope is a Hermes internal — it stays inside the
@@ -74,9 +108,17 @@ class MoonPieHermesAdapter:
             from hermes_cli.web_routers._common import _config_profile_scope
 
             with _config_profile_scope(None):
-                return agent.chat(content, stream_callback=stream_callback)
+                return agent.chat(content, stream_callback=_wrapped_stream)
 
-        return await asyncio.to_thread(_run)
+        try:
+            result = await asyncio.to_thread(_run)
+            return result
+        finally:
+            with self._turn_lock:
+                turn.completed = True
+                # Only remove if this is still the current turn for the device
+                if self._active_turns.get(device_id) is turn:
+                    self._active_turns.pop(device_id, None)
 
     async def synthesize_speech(self, text: str) -> Optional[bytes]:
         """Synthesise speech for *text* and return the audio bytes.
@@ -120,24 +162,83 @@ class MoonPieHermesAdapter:
             return None
 
     # ------------------------------------------------------------------
+    # Cancellation (Gate 6, B5)
+    # ------------------------------------------------------------------
+
+    def cancel_turn(self, device_id: str, conversation_id: str) -> dict:
+        """Cancel the active turn for *device_id* if it matches *conversation_id*.
+
+        Returns a dict with:
+        - ``cancelled`` (bool): whether a turn was found and signalled
+        - ``already_complete`` (bool): the turn had already finished
+        - ``not_found`` (bool): no active turn for this device
+        - ``withdrawn_approvals`` (list[str]): request_ids of approvals withdrawn
+        """
+        with self._turn_lock:
+            turn = self._active_turns.get(device_id)
+
+        if turn is None:
+            return {"cancelled": False, "not_found": True,
+                    "already_complete": False, "withdrawn_approvals": []}
+
+        if turn.conversation_id != conversation_id:
+            return {"cancelled": False, "not_found": True,
+                    "already_complete": False, "withdrawn_approvals": []}
+
+        if turn.completed:
+            return {"cancelled": False, "not_found": False,
+                    "already_complete": True, "withdrawn_approvals": []}
+
+        # Signal cancellation
+        turn.cancelled_event.set()
+
+        # Withdraw all pending approvals for this session
+        withdrawn: list[str] = []
+        if turn.session_key and turn.pending_approvals:
+            try:
+                from tools.approval import withdraw_gateway_approval
+                for req_id in list(turn.pending_approvals):
+                    if withdraw_gateway_approval(turn.session_key, req_id,
+                                                 cause="conversation.cancel"):
+                        withdrawn.append(req_id)
+            except Exception:
+                _log.warning("Failed to withdraw approvals", exc_info=True)
+
+        with self._turn_lock:
+            # Remove from active turns so a new message can start immediately
+            if self._active_turns.get(device_id) is turn:
+                self._active_turns.pop(device_id, None)
+
+        return {"cancelled": True, "not_found": False,
+                "already_complete": False, "withdrawn_approvals": withdrawn}
+
+    def _current_turn(self, device_id: str) -> _TurnState | None:
+        """Return the active turn for *device_id* (None if none)."""
+        with self._turn_lock:
+            return self._active_turns.get(device_id)
+
+    # ------------------------------------------------------------------
     # Private — Hermes-specific internals
     # ------------------------------------------------------------------
 
     async def _get_agent(
-        self, tool_event_callback: Callable[[str, dict], None] | None = None
+        self, tool_event_callback: Callable[[str, dict], None] | None = None,
+        *, device_id: str = "",
     ) -> Optional[Any]:
         """Lazily initialise a shared ``AIAgent`` for MoonPie clients."""
         if self._agent is not None:
             # If a tool_event_callback was provided but the agent already exists,
             # wire it dynamically for this turn only.
             if tool_event_callback is not None:
-                self._wire_tool_callbacks(self._agent, tool_event_callback)
+                self._wire_tool_callbacks(self._agent, tool_event_callback,
+                                          device_id=device_id)
             return self._agent
 
         async with self._lock:
             if self._agent is not None:
                 if tool_event_callback is not None:
-                    self._wire_tool_callbacks(self._agent, tool_event_callback)
+                    self._wire_tool_callbacks(self._agent, tool_event_callback,
+                                              device_id=device_id)
                 return self._agent
 
             try:
@@ -185,7 +286,8 @@ class MoonPieHermesAdapter:
 
                 self._agent = await asyncio.to_thread(_init)
                 if tool_event_callback is not None:
-                    self._wire_tool_callbacks(self._agent, tool_event_callback)
+                    self._wire_tool_callbacks(self._agent, tool_event_callback,
+                                              device_id=device_id)
                 _log.info(
                     "MoonPie agent initialized: provider=%s model=%s",
                     getattr(self._agent, "provider", "?"),
@@ -197,22 +299,39 @@ class MoonPieHermesAdapter:
 
         return self._agent
 
-    @staticmethod
     def _wire_tool_callbacks(
+        self,
         agent: Any,
         tool_event_callback: Callable[[str, dict], None],
+        *, device_id: str = "",
     ) -> None:
         """Wire Hermes tool callbacks into normalized MoonPie tool events.
 
         The adapter normalizes at the boundary so the router never sees
         Hermes-specific shapes.
+
+        Gate 6: Tool events are dropped if the turn has been cancelled.
+        Pending approvals are tracked so they can be withdrawn on cancel.
         """
         import time
 
         _start_times: dict[str, float] = {}
+        _adapter = self
+
+        def _is_cancelled() -> bool:
+            turn = _adapter._current_turn(device_id)
+            return turn is not None and turn.cancelled_event.is_set()
 
         def _on_tool_start(call_id: str, tool_name: str, args: dict) -> None:
+            if _is_cancelled():
+                return
             _start_times[call_id] = time.time()
+            # Track approval request_ids if present in args
+            turn = _adapter._current_turn(device_id)
+            if turn is not None and args:
+                req_id = args.get("request_id") or args.get("approval_request_id")
+                if req_id:
+                    turn.pending_approvals.add(str(req_id))
             # Sanitize: drop any args that might contain secrets
             preview = tool_name
             tool_event_callback(
@@ -227,6 +346,8 @@ class MoonPieHermesAdapter:
         def _on_tool_complete(
             call_id: str, tool_name: str, args: dict, result: Any
         ) -> None:
+            if _is_cancelled():
+                return
             started_at = _start_times.pop(call_id, None)
             duration_ms = (
                 int((time.time() - started_at) * 1000)
