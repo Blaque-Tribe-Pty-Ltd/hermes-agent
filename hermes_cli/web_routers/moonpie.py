@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from hermes_cli.web_routers._common import http_failure, require
 from hermes_cli.moonpie_adapter import MoonPieHermesAdapter
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -583,6 +582,12 @@ async def broadcast_to_all(payload: dict):
 
 # ---------------------------------------------------------------------------
 # Token-auth integration
+#
+# NOTE: These imports are intentional remaining Hermes coupling.  The
+# dashboard_auth subsystem is shared across all Hermes web routers and is
+# NOT MoonPie-specific.  Extracting it behind a generic auth seam is
+# deferred to a future gate (auth-seam extraction) so that Gate 2 stays
+# scoped to AIAgent adapter isolation only.
 # ---------------------------------------------------------------------------
 
 from hermes_cli.dashboard_auth.moonpie_provider import MoonPieDeviceProvider

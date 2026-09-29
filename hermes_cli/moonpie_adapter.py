@@ -5,6 +5,11 @@ router (``web_routers/moonpie.py``).  It is the **only** module in the
 MoonPie gateway path permitted to import ``AIAgent``, ``_config_profile_scope``,
 Hermes config, or TTS tools.
 
+IMPORTANT: This is a **temporary isolation seam** for Gate 2 (B3), not the
+future Moonbeam Client API boundary.  It is a direct MoonPie→Hermes bridge
+that removes router-level coupling.  A future Client API gate will introduce
+a Moonbeam service abstraction between the client and this adapter.
+
 Design principles:
 - The adapter owns the Hermes interaction surface.
 - The router depends on the adapter, never on Hermes internals.
