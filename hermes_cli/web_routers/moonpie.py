@@ -350,12 +350,22 @@ async def respond_approval(approval_id: str, req: ApprovalRespondRequest, author
 # ---------------------------------------------------------------------------
 
 class _MoonPieConnection:
-    """One WebSocket connection from a MoonPie client."""
+    """One WebSocket connection from a MoonPie client.
 
-    def __init__(self, websocket: WebSocket, device_id: str):
+    Authentication is an explicit state transition:
+    - ``device_id is None`` → unauthenticated (can only send ``auth.login``)
+    - ``device_id is set`` → authenticated (protected operations available)
+    """
+
+    def __init__(self, websocket: WebSocket):
         self.websocket = websocket
-        self.device_id = device_id
+        self.device_id: Optional[str] = None
         self.connected_at = time.time()
+        self.authenticated_at: Optional[float] = None
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self.device_id is not None
 
     async def send_json(self, data: dict):
         try:
@@ -371,56 +381,32 @@ _moonpie_connections: Dict[str, _MoonPieConnection] = {}
 async def moonpie_websocket(websocket: WebSocket):
     """Bidirectional WebSocket for MoonPie native clients.
 
-    Auth is via a ``device_token`` query parameter or the first JSON-RPC
-    ``auth.login`` message.
+    Authentication is message-based via ``auth.login``. No credentials are
+    accepted through the URL or query parameters.
+
+    Connection lifecycle:
+    1. Socket accepted → unauthenticated state
+    2. Client sends ``auth.login`` with device_token in message body
+    3. Server validates against shared ``_device_tokens``
+    4. On success: state → authenticated, ``connection.ready`` emitted
+    5. On failure: socket closed with code 4001
+
+    Reauthentication policy: a second ``auth.login`` on an already-
+    authenticated connection is rejected.
     """
     await websocket.accept()
 
-    device_id: Optional[str] = None
-    token = websocket.query_params.get("device_token", "")
-
-    if token:
-        device_id = _device_tokens.get(token)
-
-    # If no valid device id from query param, wait for an auth.login message
-    if not device_id:
-        try:
-            msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
-            data = json.loads(msg)
-            if data.get("method") == "auth.login":
-                token = data.get("params", {}).get("device_token", "")
-                device_id = _device_tokens.get(token)
-        except asyncio.TimeoutError:
-            await websocket.close(code=4001, reason="Authentication timeout")
-            return
-        except Exception:
-            await websocket.close(code=4001, reason="Invalid authentication")
-            return
-
-    if not device_id:
-        await websocket.close(code=4001, reason="Invalid device token")
-        return
-
-    conn = _MoonPieConnection(websocket, device_id)
-    _moonpie_connections[device_id] = conn
-    _log.info("MoonPie WebSocket connected: %s", device_id)
-
-    # Send an immediate ready notification so native clients mark the
-    # connection as established without waiting for the first delta.
-    await conn.send_json({
-        "jsonrpc": "2.0",
-        "method": "connection.ready",
-        "params": {
-            "device_id": device_id,
-        },
-    })
+    conn = _MoonPieConnection(websocket)
+    _log.info("MoonPie WebSocket accepted (unauthenticated)")
 
     try:
         await _moonpie_loop(conn)
     except WebSocketDisconnect:
-        _log.info("MoonPie WebSocket disconnected: %s", device_id)
+        _log.info("MoonPie WebSocket disconnected: %s",
+                  conn.device_id or "unauthenticated")
     finally:
-        _moonpie_connections.pop(device_id, None)
+        if conn.device_id:
+            _moonpie_connections.pop(conn.device_id, None)
 
 
 async def _moonpie_loop(conn: _MoonPieConnection):
@@ -428,6 +414,11 @@ async def _moonpie_loop(conn: _MoonPieConnection):
 
     Accepts both text and binary JSON frames so native clients can send
     ``URLSessionWebSocketTask.Message.data`` without special-casing.
+
+    Authentication state machine:
+    - Unauthenticated connections may only send ``auth.login``
+    - After successful auth.login, protected operations become available
+    - Re-authentication is rejected
     """
     while True:
         try:
@@ -460,6 +451,55 @@ async def _moonpie_loop(conn: _MoonPieConnection):
         req_id = data.get("id")
         params = data.get("params", {})
 
+        # -- Authentication gate ------------------------------------------------
+        if method == "auth.login":
+            if conn.is_authenticated:
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32001, "message": "Already authenticated"},
+                })
+                continue
+
+            token = params.get("device_token", "")
+            device_id = _device_tokens.get(token)
+            if not device_id:
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32002, "message": "Invalid device token"},
+                })
+                await conn.websocket.close(code=4001, reason="Invalid device token")
+                return
+
+            conn.device_id = device_id
+            conn.authenticated_at = time.time()
+            _moonpie_connections[device_id] = conn
+            _log.info("MoonPie WebSocket authenticated: %s", device_id)
+
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"status": "authenticated", "device_id": device_id},
+            })
+            # connection.ready is sent AFTER auth success (see below)
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "connection.ready",
+                "params": {"device_id": device_id},
+            })
+            continue
+
+        # -- Unauthenticated gate ---------------------------------------------
+        if not conn.is_authenticated:
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32003, "message": "Authentication required"},
+            })
+            continue
+
+        # -- Protected operations (require authentication) ---------------------
         if method == "conversation.message":
             payload = params.get("payload", {})
             content = payload.get("text", params.get("content", ""))

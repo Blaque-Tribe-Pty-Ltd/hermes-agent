@@ -279,3 +279,130 @@ class TestCredentialLeakage:
         # The token should not appear in application logs
         for record in caplog.records:
             assert valid_token not in record.message
+
+class TestWebSocketAuthLogin:
+    """Gate 1.1: Message-based WebSocket authentication via auth.login."""
+
+    @pytest.fixture
+    def valid_token(self, device_token_store):
+        token = "mpdt-valid-token-12345"
+        device_token_store[token] = "device-test-123"
+        return token
+
+    def test_query_string_token_ignored(self, client, valid_token):
+        """Token in WebSocket URL must not authenticate."""
+        with client.websocket_connect(f"/api/moonpie/ws?device_token={valid_token}") as ws:
+            # Connection should be accepted but unauthenticated
+            # Protected operation should be rejected
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+            msg = json.loads(ws.receive_text())
+            assert msg.get("error", {}).get("code") == -32003
+
+    def test_unauthenticated_no_protected_access(self, client):
+        """Unauthenticated socket cannot access protected operations."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "conversation.message", "params": {"text": "hello"}})
+            msg = json.loads(ws.receive_text())
+            assert msg["error"]["code"] == -32003
+            assert "Authentication required" in msg["error"]["message"]
+
+    def test_invalid_auth_login_rejected(self, client):
+        """Invalid auth.login credentials are rejected."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": "invalid"}})
+            msg = json.loads(ws.receive_text())
+            assert msg["error"]["code"] == -32002
+            assert "Invalid device token" in msg["error"]["message"]
+
+    def test_valid_auth_login_authenticates(self, client, valid_token):
+        """Valid auth.login transitions to authenticated state."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())
+            assert msg.get("result", {}).get("status") == "authenticated"
+            assert msg.get("result", {}).get("device_id") == "device-test-123"
+
+    def test_connection_ready_after_auth(self, client, valid_token):
+        """connection.ready is sent only after successful authentication."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            # Before auth: no connection.ready
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+            msg = json.loads(ws.receive_text())
+            assert msg.get("error", {}).get("code") == -32003
+
+            # Auth
+            ws.send_json({"jsonrpc": "2.0", "id": 2, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg1 = json.loads(ws.receive_text())
+            assert msg1["result"]["status"] == "authenticated"
+
+            # After auth: connection.ready arrives
+            msg2 = json.loads(ws.receive_text())
+            assert msg2.get("method") == "connection.ready"
+            assert msg2.get("params", {}).get("device_id") == "device-test-123"
+
+    def test_no_guest_id_after_auth(self, client, valid_token):
+        """Authenticated device_id must never be a synthetic guest/fallback ID."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())
+            device_id = msg["result"]["device_id"]
+            assert not device_id.startswith("guest")
+            assert not device_id.startswith("fallback")
+
+    def test_repeated_auth_login_rejected(self, client, valid_token):
+        """Second auth.login on authenticated connection is rejected."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            # First login
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())
+            assert msg["result"]["status"] == "authenticated"
+
+            # Second login
+            ws.send_json({"jsonrpc": "2.0", "id": 2, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())
+            assert msg["error"]["code"] == -32001
+            assert "Already authenticated" in msg["error"]["message"]
+
+    def test_auth_login_no_token_leak(self, client, valid_token):
+        """auth.login response must not echo the token back."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())
+            result = msg.get("result", {})
+            assert "token" not in result
+            assert valid_token not in json.dumps(msg)
+
+    def test_protected_ping_after_auth(self, client, valid_token):
+        """After auth, protected operations work."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())  # auth result
+            msg = json.loads(ws.receive_text())  # connection.ready
+
+            ws.send_json({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+            msg = json.loads(ws.receive_text())
+            assert msg.get("result") == "pong"
+
+
+class TestCredentialLeakage:
+    """Verify that bearer credentials never leak into observable channels."""
+
+    @pytest.fixture
+    def valid_token(self, device_token_store):
+        token = "mpdt-valid-token-12345"
+        device_token_store[token] = "device-test-123"
+        return token
+
+    def test_token_not_in_error_response(self, client, valid_token):
+        """Error responses must never contain the token."""
+        response = client.get(
+            "/api/moonpie/conversations",
+            headers={"Authorization": f"Bearer {valid_token}INVALID"},
+        )
+        assert valid_token not in response.text
+
+    def test_token_not_in_query_logged(self, client, caplog):
+        """Tokens supplied in query strings must not appear in logs."""
+        with caplog.at_level("INFO"):
+            client.get("/api/moonpie/conversations?token=mpdt-secret-leak-test")
+        assert "mpdt-secret-leak-test" not in caplog.text
