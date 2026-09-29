@@ -82,6 +82,76 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+def _emit_delegation_telemetry(
+    child: Any,
+    kanban_task_id: Optional[str],
+    subagent_id: Optional[str],
+    goal: str,
+    parent_agent: Any,
+) -> None:
+    """Emit model-call accounting metadata for a completed child.
+
+    Captures: task_id, agent_id, profile, role, provider, model,
+    input_tokens, cached_tokens, output_tokens, tool_calls, cost.
+    Feeds into the existing moonbeam-team/orchestrator/telemetry.py interface.
+    """
+    # Only emit for profile-routed children (the primary use case)
+    profile = getattr(child, "profile", None) or getattr(child, "_progress_identity_ref", {}).get("profile")
+    if not profile:
+        return
+    try:
+        import sys
+        import os
+        # Add moonbeam-team to path if needed
+        moonbeam_team = "/home/moonbeam/workspaces/moonbeam-team"
+        if moonbeam_team not in sys.path:
+            sys.path.insert(0, moonbeam_team)
+        from orchestrator.telemetry import record_call, estimate_cost
+    except Exception:
+        logger.debug("Telemetry import failed; skipping delegation telemetry")
+        return
+
+    try:
+        parent_task = getattr(parent_agent, "session_id", None) or ""
+        task_id = kanban_task_id or getattr(child, "session_id", "") or subagent_id or ""
+        agent_id = subagent_id or getattr(child, "session_id", "") or ""
+        model = getattr(child, "model", "")
+        provider = getattr(child, "provider", "")
+        role = getattr(child, "_delegate_role", "leaf")
+
+        # Token accounting from the child's session counters
+        input_tokens = getattr(child, "session_prompt_tokens", 0) or 0
+        output_tokens = getattr(child, "session_completion_tokens", 0) or 0
+        # Cached tokens from the last turn's usage dict
+        _last_usage = getattr(child, "_last_turn_usage", {}) or {}
+        cached_tokens = _last_usage.get("cache_read_tokens", 0) or 0
+        # Tool calls: estimate from session API calls minus 1 for the initial prompt
+        tool_calls = max(0, (getattr(child, "session_api_calls", 0) or 0) - 1)
+
+        cost = estimate_cost(model, input_tokens, output_tokens, cached_tokens)
+
+        record_call(
+            task_id=task_id,
+            agent_id=agent_id,
+            role=role,
+            model=model,
+            provider=provider,
+            parent_task=parent_task,
+            input_tokens=input_tokens,
+            cached_tokens=cached_tokens,
+            output_tokens=output_tokens,
+            tool_calls=tool_calls,
+            call_type="frontier",
+        )
+        logger.info(
+            "Delegation telemetry: profile=%s agent=%s model=%s provider=%s "
+            "input=%d output=%d cached=%d cost=%.4f",
+            profile, agent_id, model, provider, input_tokens, output_tokens, cached_tokens, cost,
+        )
+    except Exception:
+        logger.debug("Delegation telemetry emission failed", exc_info=True)
+
+
 def _open_child_session_db(parent_agent) -> Any:
     """DEDICATED SessionDB handle for the child, or None: the parent's handle can be closed by its own lifecycle while
     a background child still flushes (transcript silently dropped). It MUST open the same db FILE as the parent's
@@ -178,6 +248,8 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    # Profile-aware delegation: run child under a specific Hermes profile
+    profile: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -223,6 +295,42 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+
+    # ── Profile-aware delegation: override with target profile config ──
+    if profile:
+        from tools.profile_resolution import resolve_profile_runtime, load_profile_soul
+        try:
+            pr = resolve_profile_runtime(profile)
+        except ValueError as exc:
+            raise ValueError(f"Profile dispatch failed for '{profile}': {exc}")
+        # Override runtime with profile-specific model/provider/credentials
+        rt["model"] = pr.model
+        rt["provider"] = pr.provider
+        if pr.base_url:
+            rt["base_url"] = pr.base_url
+        if pr.api_key:
+            rt["api_key"] = pr.api_key
+        if pr.api_mode:
+            rt["api_mode"] = pr.api_mode
+        # Override system prompt with profile SOUL + task context
+        soul = load_profile_soul(profile)
+        if soul:
+            child_prompt = (
+                f"{soul}\n\n"
+                f"---\n"
+                f"You have been commissioned for a specific task. "
+                f"You are operating under the '{profile}' profile.\n\n"
+                f"{child_prompt}"
+            )
+        # Set workspace to profile home
+        from hermes_constants import named_profile_home
+        profile_home = named_profile_home(profile)
+        if profile_home:
+            rt["cwd"] = str(profile_home)
+        # Tag the child for telemetry
+        child_session_ref["profile"] = profile
+        child_session_ref["requested_profile"] = profile
+
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -385,6 +493,8 @@ def _run_single_child(
                 )
             except Exception:
                 logger.debug("kanban completion record failed for task %s", _kanban_task_id, exc_info=True)
+        # Telemetry: emit model-call accounting for profile-routed children
+        _emit_delegation_telemetry(child, _kanban_task_id, _subagent_id, goal, parent_agent)
         return run.attach_worktree(entry)
     except Exception as exc:
         # Close steer acceptance before any completion callback (see _merge_late_steer).
@@ -413,6 +523,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    profile: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -437,7 +548,8 @@ def _build_children(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), profile=profile,
+                **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -505,6 +617,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    profile: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -584,6 +697,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        profile=profile,
     )
     if err:
         return tool_error(err)
@@ -770,6 +884,12 @@ DELEGATE_TASK_SCHEMA = {
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
             ),
+            "profile": _p(
+                "string",
+                "Optional Hermes profile to run the child under (e.g. 'neo', 'tsebo', 'naledi', "
+                "'lesedi', 'pono', 'chabi'). When set, the child receives the profile's model, provider, "
+                "SOUL, toolsets, and workspace instead of inheriting the parent's. Unknown profiles fail closed.",
+            ),
         },
         "required": [],
     },
@@ -806,6 +926,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
+        profile=args.get("profile"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
