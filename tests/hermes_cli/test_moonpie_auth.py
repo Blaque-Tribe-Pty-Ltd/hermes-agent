@@ -356,6 +356,8 @@ class TestWebSocketAuthLogin:
             ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
             msg = json.loads(ws.receive_text())
             assert msg["result"]["status"] == "authenticated"
+            # Drain connection.ready notification pushed after auth
+            json.loads(ws.receive_text())
 
             # Second login
             ws.send_json({"jsonrpc": "2.0", "id": 2, "method": "auth.login", "params": {"device_token": valid_token}})
@@ -402,7 +404,8 @@ class TestCredentialLeakage:
         assert valid_token not in response.text
 
     def test_token_not_in_query_logged(self, client, caplog):
-        """Tokens supplied in query strings must not appear in logs."""
-        with caplog.at_level("INFO"):
+        """Tokens supplied in query strings must not appear in gateway logs."""
+        with caplog.at_level("INFO", logger="hermes_cli.web_server"):
             client.get("/api/moonpie/conversations?token=mpdt-secret-leak-test")
+        # httpx client logs naturally contain the URL; we only assert on gateway logs
         assert "mpdt-secret-leak-test" not in caplog.text
