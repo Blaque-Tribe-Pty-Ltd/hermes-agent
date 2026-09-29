@@ -20,9 +20,20 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket,
 from pydantic import BaseModel, Field
 
 from hermes_cli.moonpie_adapter import MoonPieHermesAdapter
+from hermes_state import SessionDB
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter(prefix="/api/moonpie")
+
+
+# Lazy SessionDB handle — one per process; thread-safe via WAL.
+_moonpie_db: Optional[SessionDB] = None
+
+def _get_moonpie_db() -> SessionDB:
+    global _moonpie_db
+    if _moonpie_db is None:
+        _moonpie_db = SessionDB()
+    return _moonpie_db
 
 # ---------------------------------------------------------------------------
 # Approval integration (Gate 3, B4)
@@ -231,26 +242,45 @@ async def device_confirm(device_id: str):
 async def list_conversations(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    authorization: str = Header(default=""),
+    search: Optional[str] = Query(None),
+    authorization: str =  Header(default=""),
 ):
     device_id = _authenticate_device(authorization)
     _log.debug("list_conversations for %s", device_id)
-    # TODO: Query SessionDB for conversations belonging to this device/user
-    return []
+    db = _get_moonpie_db()
+    rows = db.list_moonpie_conversations(
+        device_id, limit=limit, offset=offset, search=search,
+    )
+    return [
+        ConversationSummary(
+            id=r["id"],
+            title=r["title"],
+            message_count=r["message_count"],
+            created_at=_ts_to_iso(r["created_at"]),
+            updated_at=_ts_to_iso(r["updated_at"]),
+        )
+        for r in rows
+    ]
+
+
+def _ts_to_iso(ts: float) -> str:
+    """Convert a Unix timestamp (REAL) to ISO 8601 UTC string."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
 @router.post("/conversations", response_model=ConversationDetail)
-async def create_conversation(authorization: str = Header(default="")):
+async def create_conversation(authorization: str =  Header(default="")):
     device_id = _authenticate_device(authorization)
-    conv_id = f"conv-{uuid.uuid4().hex[:12]}"
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    db = _get_moonpie_db()
+    conv_id = db.create_moonpie_conversation(device_id, title="New Conversation")
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _log.info("MoonPie conversation created: %s by %s", conv_id, device_id)
     return ConversationDetail(
         id=conv_id,
         title="New Conversation",
         messages=[],
-        created_at=now,
-        updated_at=now,
+        created_at=now_iso,
+        updated_at=now_iso,
     )
 
 
@@ -270,12 +300,25 @@ async def get_conversation(conversation_id: str, authorization: str = Header(def
 async def list_jobs(
     status: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    authorization: str = Header(default=""),
+    offset: int = Query(0, ge=0),
+    authorization: str =  Header(default=""),
 ):
     device_id = _authenticate_device(authorization)
     _log.debug("list_jobs for %s", device_id)
-    # TODO: Query kanban / session state for jobs
-    return []
+    db = _get_moonpie_db()
+    rows = db.list_moonpie_jobs(device_id, limit=limit, offset=offset, status=status)
+    return [
+        JobSummary(
+            id=r["id"],
+            title=r["title"],
+            status=r["status"],
+            progress=r["progress"],
+            message=r["message"],
+            created_at=_ts_to_iso(r["created_at"]),
+            completed_at=_ts_to_iso(r["completed_at"]) if r["completed_at"] else None,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetail)
@@ -299,19 +342,24 @@ async def get_job_diff(job_id: str, authorization: str = Header(default="")):
 # ---------------------------------------------------------------------------
 
 @router.get("/approvals", response_model=List[ApprovalSummary])
-async def list_approvals(authorization: str = Header(default="")):
+async def list_approvals(
+    status: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    authorization: str = Header(default=""),
+):
     device_id = _authenticate_device(authorization)
-    session_key = _approval_session_key(device_id)
-    _log.debug("list_approvals for %s (session_key=%s)", device_id, session_key)
-    pending = list_gateway_approvals(session_key)
+    _log.debug("list_approvals for %s", device_id)
+    db = _get_moonpie_db()
+    rows = db.list_moonpie_approvals(device_id, limit=limit, offset=offset, status=status)
     return [
         ApprovalSummary(
-            approval_id=p.get("request_id", ""),
-            command=p.get("command", ""),
-            description=p.get("description", ""),
-            status="pending",
+            approval_id=r["id"],
+            command=r["command"],
+            description=r["description"],
+            status=r["status"],
         )
-        for p in pending
+        for r in rows
     ]
 
 
@@ -323,6 +371,14 @@ async def respond_approval(approval_id: str, req: ApprovalRespondRequest, author
     resolved = resolve_gateway_approval(session_key, req.action, request_id=approval_id)
     if resolved == 0:
         raise HTTPException(status_code=404, detail="Approval not found or already resolved")
+
+    # Persist the resolution so list_approvals reflects the outcome.
+    try:
+        db = _get_moonpie_db()
+        db.resolve_moonpie_approval(approval_id, status="resolved", action=req.action)
+    except Exception:
+        _log.warning("Failed to persist approval resolution %s to SessionDB", approval_id, exc_info=True)
+
     return {"ok": True, "approval_id": approval_id, "action": req.action}
 
 
@@ -360,17 +416,35 @@ class _MoonPieConnection:
 
     def _approval_notify(self, approval_data: dict) -> None:
         """Sync callback invoked from the agent thread when a dangerous command
-        needs approval.  Bridges to the async WebSocket via the running loop."""
+        needs approval.  Bridges to the async WebSocket via the running loop
+        and persists the approval record to SessionDB."""
         import asyncio
+        approval_id = approval_data.get("request_id", "")
+        command = approval_data.get("command", "")
+        description = approval_data.get("description", "")
+
+        # Persist the approval so list_approvals survives restart.
+        try:
+            db = _get_moonpie_db()
+            db.create_moonpie_approval(
+                device_id=self.device_id or "",
+                session_key=self.session_key,
+                command=command,
+                description=description,
+                approval_id=approval_id,
+            )
+        except Exception:
+            _log.warning("Failed to persist approval %s to SessionDB", approval_id, exc_info=True)
+
         loop = asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(
             self.send_json({
                 "jsonrpc": "2.0",
                 "method": "approval.request",
                 "params": {
-                    "approval_id": approval_data.get("request_id", ""),
-                    "command": approval_data.get("command", ""),
-                    "description": approval_data.get("description", ""),
+                    "approval_id": approval_id,
+                    "command": command,
+                    "description": description,
                     "actions": ["once", "session", "always", "deny"],
                 },
             }),
@@ -615,6 +689,15 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             action = params.get("action", "")
             _log.info("MoonPie approval response: %s action=%s from %s", approval_id, action, conn.device_id)
             resolved = resolve_gateway_approval(conn.session_key, action, request_id=approval_id)
+
+            # Persist the resolution so list_approvals reflects the outcome.
+            if resolved:
+                try:
+                    db = _get_moonpie_db()
+                    db.resolve_moonpie_approval(approval_id, status="resolved", action=action)
+                except Exception:
+                    _log.warning("Failed to persist WS approval resolution %s to SessionDB", approval_id, exc_info=True)
+
             if resolved == 0:
                 await conn.send_json({
                     "jsonrpc": "2.0",

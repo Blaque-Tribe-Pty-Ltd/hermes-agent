@@ -249,7 +249,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -591,6 +591,53 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+
+-- MoonPie domain tables (Gate 4: Session Parity / Persistence)
+CREATE TABLE IF NOT EXISTS moonpie_conversations (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_moonpie_conv_device_updated
+    ON moonpie_conversations(device_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moonpie_conv_device_archived
+    ON moonpie_conversations(device_id, archived, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS moonpie_jobs (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    progress REAL,
+    message TEXT,
+    created_at REAL NOT NULL,
+    completed_at REAL,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_moonpie_job_device_created
+    ON moonpie_jobs(device_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moonpie_job_device_status
+    ON moonpie_jobs(device_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS moonpie_approvals (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    command TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    action TEXT,
+    created_at REAL NOT NULL,
+    resolved_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_moonpie_approval_device_created
+    ON moonpie_approvals(device_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_moonpie_approval_device_status
+    ON moonpie_approvals(device_id, status, created_at DESC);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.

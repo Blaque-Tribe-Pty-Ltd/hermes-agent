@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -101,28 +102,36 @@ def ws_auth(client, valid_token):
 class TestRestApprovalEndpoints:
     """REST approvals must expose real gateway queue state."""
 
-    def test_list_approvals_returns_pending(self, client, valid_token):
-        """list_approvals returns actual pending approvals from the gateway queue."""
-        session_key = "moonpie_moonpie-test-device"
-        # Seed a pending approval
-        approval_mod._gateway_queues[session_key] = [
-            wait_mod._ApprovalEntry({
-                "request_id": "req-001",
-                "command": "rm -rf /tmp/x",
-                "description": "dangerous command",
-            })
-        ]
+    def test_list_approvals_returns_pending(self, client, valid_token, tmp_path):
+        """list_approvals returns actual pending approvals from SessionDB."""
+        from hermes_state import SessionDB
+        from hermes_cli.web_routers import moonpie as mp
 
-        response = client.get(
-            "/api/moonpie/approvals",
-            headers={"Authorization": f"Bearer {valid_token}"},
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert len(body) == 1
-        assert body[0]["approval_id"] == "req-001"
-        assert body[0]["command"] == "rm -rf /tmp/x"
-        assert body[0]["status"] == "pending"
+        db = SessionDB(db_path=tmp_path / "state.db")
+        original = mp._moonpie_db
+        mp._moonpie_db = db
+        try:
+            device_id = "moonpie-test-device"
+            db.create_moonpie_approval(
+                device_id=device_id,
+                session_key="moonpie_moonpie-test-device",
+                command="rm -rf /tmp/x",
+                description="dangerous command",
+                approval_id="req-001",
+            )
+
+            response = client.get(
+                "/api/moonpie/approvals",
+                headers={"Authorization": f"Bearer {valid_token}"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert len(body) == 1
+            assert body[0]["approval_id"] == "req-001"
+            assert body[0]["command"] == "rm -rf /tmp/x"
+            assert body[0]["status"] == "pending"
+        finally:
+            mp._moonpie_db = original
 
     def test_list_approvals_empty_when_none_pending(self, client, valid_token):
         """No pending approvals → empty list."""
