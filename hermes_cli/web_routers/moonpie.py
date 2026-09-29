@@ -25,10 +25,32 @@ _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter(prefix="/api/moonpie")
 
 # ---------------------------------------------------------------------------
+# Approval integration (Gate 3, B4)
+# ---------------------------------------------------------------------------
+
+from tools.approval import (
+    list_gateway_approvals,
+    register_gateway_notify,
+    resolve_gateway_approval,
+    unregister_gateway_notify,
+)
+from tools.approval_context import set_current_session_key, reset_current_session_key
+from gateway.session_context import set_session_vars, clear_session_vars
+
+# ---------------------------------------------------------------------------
 # Agent integration — delegated to the Hermes adapter (Gate 2, B3)
 # ---------------------------------------------------------------------------
 
 _moonpie_adapter = MoonPieHermesAdapter()
+
+
+def _approval_session_key(device_id: str) -> str:
+    """Canonical approval session key for a MoonPie device.
+
+    The gateway approval system scopes pending approvals by session_key.
+    Using a moonpie-prefixed key ensures isolation from other platforms.
+    """
+    return f"moonpie_{device_id}"
 
 # ---------------------------------------------------------------------------
 # Models
@@ -91,12 +113,10 @@ class JobDetail(JobSummary):
 
 
 class ApprovalSummary(BaseModel):
-    id: str
-    job_id: str
-    title: str
+    approval_id: str
+    command: str
     description: str
-    actions: List[str]
-    timeout_at: str
+    status: str
 
 
 class ApprovalRespondRequest(BaseModel):
@@ -281,16 +301,28 @@ async def get_job_diff(job_id: str, authorization: str = Header(default="")):
 @router.get("/approvals", response_model=List[ApprovalSummary])
 async def list_approvals(authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
-    _log.debug("list_approvals for %s", device_id)
-    # TODO: Query pending approvals from approval queue
-    return []
+    session_key = _approval_session_key(device_id)
+    _log.debug("list_approvals for %s (session_key=%s)", device_id, session_key)
+    pending = list_gateway_approvals(session_key)
+    return [
+        ApprovalSummary(
+            approval_id=p.get("request_id", ""),
+            command=p.get("command", ""),
+            description=p.get("description", ""),
+            status="pending",
+        )
+        for p in pending
+    ]
 
 
 @router.post("/approvals/{approval_id}/respond")
 async def respond_approval(approval_id: str, req: ApprovalRespondRequest, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
+    session_key = _approval_session_key(device_id)
     _log.info("MoonPie approval response: %s action=%s from %s", approval_id, req.action, device_id)
-    # TODO: Route to the running agent / kanban system
+    resolved = resolve_gateway_approval(session_key, req.action, request_id=approval_id)
+    if resolved == 0:
+        raise HTTPException(status_code=404, detail="Approval not found or already resolved")
     return {"ok": True, "approval_id": approval_id, "action": req.action}
 
 
@@ -316,11 +348,34 @@ class _MoonPieConnection:
     def is_authenticated(self) -> bool:
         return self.device_id is not None
 
+    @property
+    def session_key(self) -> str:
+        return _approval_session_key(self.device_id) if self.device_id else ""
+
     async def send_json(self, data: dict):
         try:
             await self.websocket.send_text(json.dumps(data))
         except Exception:
             _log.warning("send_json failed to %s", self.device_id, exc_info=True)
+
+    def _approval_notify(self, approval_data: dict) -> None:
+        """Sync callback invoked from the agent thread when a dangerous command
+        needs approval.  Bridges to the async WebSocket via the running loop."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        asyncio.run_coroutine_threadsafe(
+            self.send_json({
+                "jsonrpc": "2.0",
+                "method": "approval.request",
+                "params": {
+                    "approval_id": approval_data.get("request_id", ""),
+                    "command": approval_data.get("command", ""),
+                    "description": approval_data.get("description", ""),
+                    "actions": ["once", "session", "always", "deny"],
+                },
+            }),
+            loop,
+        )
 
 
 _moonpie_connections: Dict[str, _MoonPieConnection] = {}
@@ -356,6 +411,13 @@ async def moonpie_websocket(websocket: WebSocket):
     finally:
         if conn.device_id:
             _moonpie_connections.pop(conn.device_id, None)
+            # Unregister from the gateway approval system so pending approvals
+            # don't try to push to a dead connection.  The approval waiter will
+            # wake with a "cancelled" cause (fail-closed).
+            try:
+                unregister_gateway_notify(conn.session_key)
+            except Exception:
+                _log.debug("unregister_gateway_notify failed for %s", conn.device_id, exc_info=True)
 
 
 async def _moonpie_loop(conn: _MoonPieConnection):
@@ -426,6 +488,10 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             _moonpie_connections[device_id] = conn
             _log.info("MoonPie WebSocket authenticated: %s", device_id)
 
+            # Register this device with the gateway approval system so
+            # dangerous-command prompts are pushed to this connection.
+            register_gateway_notify(conn.session_key, conn._approval_notify)
+
             await conn.send_json({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -471,7 +537,16 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     loop,
                 )
 
+            session_tokens = []
             try:
+                # Bind the gateway approval context so dangerous-command guards
+                # route approval requests to this MoonPie session.
+                session_tokens = set_session_vars(
+                    platform="moonpie",
+                    session_key=conn.session_key,
+                    async_delivery=True,
+                )
+                set_current_session_key(conn.session_key)
                 final_response = await _moonpie_adapter.chat(content, stream_callback=stream_callback)
 
                 # If the model didn't stream deltas, send one full delta now so the
@@ -523,6 +598,9 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     "id": req_id,
                     "error": {"code": -32000, "message": str(exc)},
                 })
+            finally:
+                if session_tokens:
+                    clear_session_vars(session_tokens)
 
         elif method == "conversation.start":
             conv_id = f"conv-{uuid.uuid4().hex[:12]}"
@@ -536,12 +614,19 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             approval_id = params.get("approval_id", "")
             action = params.get("action", "")
             _log.info("MoonPie approval response: %s action=%s from %s", approval_id, action, conn.device_id)
-            # TODO: Route to the active kanban approval queue
-            await conn.send_json({
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"status": "received", "approval_id": approval_id},
-            })
+            resolved = resolve_gateway_approval(conn.session_key, action, request_id=approval_id)
+            if resolved == 0:
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32004, "message": "Approval not found or already resolved"},
+                })
+            else:
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {"status": "resolved", "approval_id": approval_id, "action": action},
+                })
 
         elif method == "device.capabilities":
             await conn.send_json({
