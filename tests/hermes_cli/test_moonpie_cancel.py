@@ -127,19 +127,19 @@ class TestWebSocketCancelRouting:
     """Integration tests for conversation.cancel through the WebSocket router."""
 
     @pytest.fixture(autouse=True)
-    def reset_adapter(self):
+    def reset_adapter(self, tmp_path):
         from hermes_cli.web_routers import moonpie as mp
+        from hermes_state import SessionDB
+        db_path = tmp_path / "test_state.db"
+        db = SessionDB(db_path=db_path)
+        original_db = mp._moonpie_db
+        mp._moonpie_db = db
         mp._moonpie_adapter = MoonPieHermesAdapter()
         mp._moonpie_connections.clear()
-        mp._device_tokens.clear()
-        mp._registered_devices.clear()
-        mp._pending_pairings.clear()
         yield
+        mp._moonpie_db = original_db
         mp._moonpie_adapter = MoonPieHermesAdapter()
         mp._moonpie_connections.clear()
-        mp._device_tokens.clear()
-        mp._registered_devices.clear()
-        mp._pending_pairings.clear()
 
     @pytest.fixture
     def client(self):
@@ -154,6 +154,12 @@ class TestWebSocketCancelRouting:
     @pytest.fixture
     def auth_ws(self, client):
         """Register a device and open an authenticated WebSocket."""
+        from hermes_cli.web_routers import moonpie as mp
+        # Seed root token for confirmation
+        mp._moonpie_db.register_moonpie_device("root-device", name="Root", public_key="pk-root", pairing_code="ROOT")
+        mp._moonpie_db.confirm_moonpie_device("root-device")
+        mp._moonpie_db.store_moonpie_device_token("mpdt-root-token", "root-device")
+
         # Register
         resp = client.post("/api/moonpie/devices/register", json={
             "name": "Test Device",
@@ -164,8 +170,6 @@ class TestWebSocketCancelRouting:
         pairing_code = data["pairing_code"]
 
         # Confirm (requires auth from an existing trusted device)
-        from hermes_cli.web_routers import moonpie as mp
-        mp._device_tokens["mpdt-root-token"] = "root-device"
         client.post(
             f"/api/moonpie/devices/{device_id}/confirm",
             headers={"Authorization": "Bearer mpdt-root-token"},

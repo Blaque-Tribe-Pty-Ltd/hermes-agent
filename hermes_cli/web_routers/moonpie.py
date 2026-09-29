@@ -135,14 +135,6 @@ class ApprovalRespondRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# In-memory stores (replace with SessionDB / persistent storage)
-# ---------------------------------------------------------------------------
-
-_pending_pairings: Dict[str, Dict[str, Any]] = {}
-_registered_devices: Dict[str, Dict[str, Any]] = {}
-_device_tokens: Dict[str, str] = {}  # token -> device_id
-
-# ---------------------------------------------------------------------------
 # Auth helper
 # ---------------------------------------------------------------------------
 
@@ -156,10 +148,22 @@ def _authenticate_device(authorization: str = Header(default="")) -> str:
     token = _bearer_token_from_header(authorization)
     if not token:
         raise HTTPException(status_code=401, detail="Missing authorization header")
-    device_id = _device_tokens.get(token)
+    device_id = _verify_device_token(token)
     if not device_id:
         raise HTTPException(status_code=401, detail="Invalid or expired device token")
     return device_id
+
+
+def _verify_device_token(token: str) -> Optional[str]:
+    """Return device_id if *token* is valid and not expired, else None."""
+    db = _get_moonpie_db()
+    row = db.get_moonpie_device_token(token)
+    if row is None:
+        return None
+    expires_at = row.get("expires_at")
+    if expires_at is not None and time.time() > expires_at:
+        return None
+    return row["device_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -176,16 +180,13 @@ async def device_register(req: DeviceRegisterRequest):
     device_id = f"moonpie-{uuid.uuid4().hex[:12]}"
     pairing_code = uuid.uuid4().hex[:6].upper()
 
-    _pending_pairings[device_id] = {
-        "device_id": device_id,
-        "name": req.name,
-        "model": req.model,
-        "os_version": req.os_version,
-        "public_key": req.public_key,
-        "pairing_code": pairing_code,
-        "created_at": time.time(),
-        "confirmed": False,
-    }
+    db = _get_moonpie_db()
+    db.register_moonpie_device(
+        device_id=device_id,
+        name=req.name,
+        public_key=req.public_key,
+        pairing_code=pairing_code,
+    )
 
     _log.info("MoonPie device registered: %s (%s)", device_id, req.name)
     return DeviceRegisterResponse(
@@ -198,25 +199,20 @@ async def device_register(req: DeviceRegisterRequest):
 @router.post("/devices/verify", response_model=DeviceVerifyResponse)
 async def device_verify(req: DeviceVerifyRequest):
     """Exchange a confirmed pairing code for a long-lived device JWT."""
-    pending = _pending_pairings.get(req.device_id)
-    if not pending:
+    db = _get_moonpie_db()
+    device = db.get_moonpie_device(req.device_id)
+    if not device:
         raise HTTPException(status_code=404, detail="Device not found or pairing expired")
 
-    if pending["pairing_code"] != req.pairing_code:
+    if device.get("pairing_code") != req.pairing_code:
         raise HTTPException(status_code=400, detail="Invalid pairing code")
 
-    if not pending.get("confirmed"):
+    if not device.get("confirmed"):
         raise HTTPException(status_code=403, detail="Pairing not yet confirmed by user")
 
     # Generate device JWT (placeholder — replace with real JWT signing)
     token = f"mpdt-{uuid.uuid4().hex}"
-    _device_tokens[token] = req.device_id
-    _registered_devices[req.device_id] = {
-        **_pending_pairings[req.device_id],
-        "token": token,
-        "confirmed_at": time.time(),
-    }
-    del _pending_pairings[req.device_id]
+    db.store_moonpie_device_token(token, req.device_id)
 
     _log.info("MoonPie device verified: %s", req.device_id)
     return DeviceVerifyResponse(device_token=token)
@@ -236,8 +232,9 @@ def _require_operator_auth(request: Request):
     bearer = extract_bearer(request)
     if bearer:
         # Existing device token is a trusted authority
-        if bearer in _device_tokens:
-            return {"type": "device", "device_id": _device_tokens[bearer]}
+        device_id = _verify_device_token(bearer)
+        if device_id:
+            return {"type": "device", "device_id": device_id}
 
         # Dashboard session token
         from hermes_cli.dashboard_auth import list_session_providers
@@ -270,11 +267,12 @@ async def device_confirm(device_id: str, request: Request, _session=Depends(_req
 
     Requires a valid trusted authority: existing device token or dashboard session.
     """
-    pending = _pending_pairings.get(device_id)
-    if not pending:
+    db = _get_moonpie_db()
+    device = db.get_moonpie_device(device_id)
+    if not device:
         raise HTTPException(status_code=404, detail="Device not found or pairing expired")
 
-    pending["confirmed"] = True
+    db.confirm_moonpie_device(device_id)
     _log.info("MoonPie device pairing confirmed: %s", device_id)
     return {"ok": True, "device_id": device_id}
 
@@ -510,7 +508,7 @@ async def moonpie_websocket(websocket: WebSocket):
     Connection lifecycle:
     1. Socket accepted → unauthenticated state
     2. Client sends ``auth.login`` with device_token in message body
-    3. Server validates against shared ``_device_tokens``
+    3. Server validates device token against SessionDB
     4. On success: state → authenticated, ``connection.ready`` emitted
     5. On failure: socket closed with code 4001
 
@@ -592,7 +590,7 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                 continue
 
             token = params.get("device_token", "")
-            device_id = _device_tokens.get(token)
+            device_id = _verify_device_token(token)
             if not device_id:
                 await conn.send_json({
                     "jsonrpc": "2.0",
@@ -870,7 +868,7 @@ from hermes_cli.dashboard_auth.registry import register_global_provider
 from hermes_cli.dashboard_auth.token_auth import register_token_route
 
 # Inject the verify callback so the provider can validate device tokens
-MoonPieDeviceProvider.set_verify_callback(lambda token: _device_tokens.get(token))
+MoonPieDeviceProvider.set_verify_callback(_verify_device_token)
 
 # Register the provider with the dashboard auth system
 register_global_provider(MoonPieDeviceProvider())

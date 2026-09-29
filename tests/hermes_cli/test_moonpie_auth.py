@@ -24,7 +24,7 @@ from hermes_cli.dashboard_auth.token_auth import (
     clear_token_routes, is_token_route, register_token_route,
 )
 from hermes_cli.web_routers import moonpie as moonpie_router
-from hermes_cli.web_routers.moonpie import _device_tokens as _module_device_tokens
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -40,17 +40,15 @@ def clean_token_routes():
 
 
 @pytest.fixture
-def device_token_store():
-    """Shared in-memory token store for tests.
-    
-    Patches the module-level _device_tokens dict so both the handler
-    and the provider use the same store during tests.
-    """
-    original = dict(_module_device_tokens)
-    _module_device_tokens.clear()
-    yield _module_device_tokens
-    _module_device_tokens.clear()
-    _module_device_tokens.update(original)
+def device_token_store(tmp_path):
+    """Shared temporary SessionDB for tests."""
+    from hermes_cli.web_routers import moonpie as mp
+    db_path = tmp_path / "test_state.db"
+    db = SessionDB(db_path=db_path)
+    original_db = mp._moonpie_db
+    mp._moonpie_db = db
+    yield db
+    mp._moonpie_db = original_db
 
 
 @pytest.fixture
@@ -78,7 +76,10 @@ def client(moonpie_app):
 def valid_token(device_token_store):
     """Create and return a valid device token."""
     token = "mpdt-test-valid-token"
-    device_token_store[token] = "moonpie-test-device"
+    device_id = "moonpie-test-device"
+    device_token_store.register_moonpie_device(device_id, name="Test", public_key="pk", pairing_code="PC")
+    device_token_store.confirm_moonpie_device(device_id)
+    device_token_store.store_moonpie_device_token(token, device_id)
     return token
 
 
@@ -211,7 +212,9 @@ class TestDeviceConfirmAuth:
     def test_confirm_with_valid_device_token_succeeds(self, client, device_token_store):
         """An existing trusted device can confirm a new device pairing."""
         # Seed a root/trusted device token
-        device_token_store["mpdt-root-token"] = "root-device"
+        device_token_store.register_moonpie_device("root-device", name="Root", public_key="pk", pairing_code="ROOT")
+        device_token_store.confirm_moonpie_device("root-device")
+        device_token_store.store_moonpie_device_token("mpdt-root-token", "root-device")
 
         # Register a new device
         resp = client.post(
@@ -258,8 +261,10 @@ class TestDeviceConfirmAuth:
 
     def test_full_flow_token_auth_login(self, client, device_token_store):
         """Token from verified device successfully authenticates via WebSocket auth.login."""
-        # Seed root token for confirmation
-        device_token_store["mpdt-root-token"] = "root-device"
+        # Seed a root/trusted device token
+        device_token_store.register_moonpie_device("root-device", name="Root", public_key="pk", pairing_code="ROOT")
+        device_token_store.confirm_moonpie_device("root-device")
+        device_token_store.store_moonpie_device_token("mpdt-root-token", "root-device")
 
         # Register
         resp = client.post(
@@ -283,9 +288,7 @@ class TestDeviceConfirmAuth:
         )
         token = resp.json()["device_token"]
 
-        # Store the token and authenticate via WebSocket
-        device_token_store[token] = device_id
-
+        # Token is already stored by device_verify; authenticate via WebSocket
         with client.websocket_connect("/api/moonpie/ws") as ws:
             ws.send_json({
                 "jsonrpc": "2.0",
@@ -376,12 +379,14 @@ class TestTokenRouteRegistration:
     def test_provider_registered(self, device_token_store):
         """MoonPieDeviceProvider is registered and validates tokens."""
         provider = MoonPieDeviceProvider()
-        # Set callback to use the test's token store
+        # Set callback to use the real DB-backed verifier
         MoonPieDeviceProvider.set_verify_callback(
-            lambda t: device_token_store.get(t)
+            moonpie_router._verify_device_token
         )
 
-        device_token_store["test-token"] = "device-1"
+        device_token_store.register_moonpie_device("device-1", name="Test", public_key="pk", pairing_code="PC")
+        device_token_store.confirm_moonpie_device("device-1")
+        device_token_store.store_moonpie_device_token("test-token", "device-1")
         principal = provider.verify_token(token="test-token")
         assert principal is not None
         assert principal.principal == "device-1"
@@ -423,7 +428,10 @@ class TestWebSocketAuthLogin:
     @pytest.fixture
     def valid_token(self, device_token_store):
         token = "mpdt-valid-token-12345"
-        device_token_store[token] = "device-test-123"
+        device_id = "device-test-123"
+        device_token_store.register_moonpie_device(device_id, name="Test", public_key="pk", pairing_code="PC")
+        device_token_store.confirm_moonpie_device(device_id)
+        device_token_store.store_moonpie_device_token(token, device_id)
         return token
 
     def test_query_string_token_ignored(self, client, valid_token):
@@ -529,7 +537,10 @@ class TestCredentialLeakage:
     @pytest.fixture
     def valid_token(self, device_token_store):
         token = "mpdt-valid-token-12345"
-        device_token_store[token] = "device-test-123"
+        device_id = "device-test-123"
+        device_token_store.register_moonpie_device(device_id, name="Test", public_key="pk", pairing_code="PC")
+        device_token_store.confirm_moonpie_device(device_id)
+        device_token_store.store_moonpie_device_token(token, device_id)
         return token
 
     def test_token_not_in_error_response(self, client, valid_token):

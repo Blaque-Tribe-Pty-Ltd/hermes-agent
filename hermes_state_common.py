@@ -638,6 +638,27 @@ CREATE INDEX IF NOT EXISTS idx_moonpie_approval_device_created
     ON moonpie_approvals(device_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_moonpie_approval_device_status
     ON moonpie_approvals(device_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS moonpie_devices (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    public_key TEXT,
+    pairing_code TEXT,
+    confirmed INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_moonpie_device_confirmed
+    ON moonpie_devices(confirmed, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS moonpie_device_tokens (
+    token TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES moonpie_devices(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    expires_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_moonpie_token_device
+    ON moonpie_device_tokens(device_id);
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.

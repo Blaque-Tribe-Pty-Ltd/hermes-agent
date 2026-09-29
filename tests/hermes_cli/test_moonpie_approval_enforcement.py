@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli.web_routers import moonpie as moonpie_router
-from hermes_cli.web_routers.moonpie import _device_tokens as _module_device_tokens
+from hermes_state import SessionDB
 from tools import approval as approval_mod
 from tools import approval_gateway_wait as wait_mod
 
@@ -47,13 +47,15 @@ def clean_approval_state():
 
 
 @pytest.fixture
-def device_token_store():
-    """Shared in-memory token store for tests."""
-    original = dict(_module_device_tokens)
-    _module_device_tokens.clear()
-    yield _module_device_tokens
-    _module_device_tokens.clear()
-    _module_device_tokens.update(original)
+def device_token_store(tmp_path):
+    """Shared temporary SessionDB for tests."""
+    from hermes_cli.web_routers import moonpie as mp
+    db_path = tmp_path / "test_state.db"
+    db = SessionDB(db_path=db_path)
+    original_db = mp._moonpie_db
+    mp._moonpie_db = db
+    yield db
+    mp._moonpie_db = original_db
 
 
 @pytest.fixture
@@ -74,7 +76,10 @@ def client(moonpie_app):
 def valid_token(device_token_store):
     """Create and return a valid device token."""
     token = "mpdt-test-valid-token"
-    device_token_store[token] = "moonpie-test-device"
+    device_id = "moonpie-test-device"
+    device_token_store.register_moonpie_device(device_id, name="Test", public_key="pk", pairing_code="PC")
+    device_token_store.confirm_moonpie_device(device_id)
+    device_token_store.store_moonpie_device_token(token, device_id)
     return token
 
 
@@ -102,36 +107,27 @@ def ws_auth(client, valid_token):
 class TestRestApprovalEndpoints:
     """REST approvals must expose real gateway queue state."""
 
-    def test_list_approvals_returns_pending(self, client, valid_token, tmp_path):
+    def test_list_approvals_returns_pending(self, client, valid_token, device_token_store):
         """list_approvals returns actual pending approvals from SessionDB."""
-        from hermes_state import SessionDB
-        from hermes_cli.web_routers import moonpie as mp
+        device_id = "moonpie-test-device"
+        device_token_store.create_moonpie_approval(
+            device_id=device_id,
+            session_key="moonpie_moonpie-test-device",
+            command="rm -rf /tmp/x",
+            description="dangerous command",
+            approval_id="req-001",
+        )
 
-        db = SessionDB(db_path=tmp_path / "state.db")
-        original = mp._moonpie_db
-        mp._moonpie_db = db
-        try:
-            device_id = "moonpie-test-device"
-            db.create_moonpie_approval(
-                device_id=device_id,
-                session_key="moonpie_moonpie-test-device",
-                command="rm -rf /tmp/x",
-                description="dangerous command",
-                approval_id="req-001",
-            )
-
-            response = client.get(
-                "/api/moonpie/approvals",
-                headers={"Authorization": f"Bearer {valid_token}"},
-            )
-            assert response.status_code == 200
-            body = response.json()
-            assert len(body) == 1
-            assert body[0]["approval_id"] == "req-001"
-            assert body[0]["command"] == "rm -rf /tmp/x"
-            assert body[0]["status"] == "pending"
-        finally:
-            mp._moonpie_db = original
+        response = client.get(
+            "/api/moonpie/approvals",
+            headers={"Authorization": f"Bearer {valid_token}"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body) == 1
+        assert body[0]["approval_id"] == "req-001"
+        assert body[0]["command"] == "rm -rf /tmp/x"
+        assert body[0]["status"] == "pending"
 
     def test_list_approvals_empty_when_none_pending(self, client, valid_token):
         """No pending approvals → empty list."""

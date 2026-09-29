@@ -7,17 +7,19 @@ by SessionDB, with correct pagination, search, isolation, and restart recovery.
 import pytest
 from fastapi.testclient import TestClient
 
-from hermes_cli.web_routers.moonpie import router, _device_tokens, _pending_pairings, _registered_devices
+from hermes_cli.web_routers.moonpie import router
 from hermes_state import SessionDB
 
 
 @pytest.fixture(autouse=True)
-def _reset_moonpie_state():
-    """Clear in-memory device state before every test."""
-    _device_tokens.clear()
-    _pending_pairings.clear()
-    _registered_devices.clear()
+def _reset_moonpie_state(tmp_path):
+    """Inject a fresh SessionDB before every test."""
+    from hermes_cli.web_routers import moonpie as mp
+    db_path = tmp_path / "test_state.db"
+    db = SessionDB(db_path=db_path)
+    mp._moonpie_db = db
     yield
+    mp._moonpie_db = None
 
 
 @pytest.fixture
@@ -37,11 +39,17 @@ def tmp_db(tmp_path):
 
 
 @pytest.fixture
-def valid_token():
+def valid_token(tmp_path):
     """Mint a valid device token."""
+    from hermes_cli.web_routers import moonpie as mp
     token = "mpdt-test-token-abc123"
     device_id = "moonpie-test-device"
-    _device_tokens[token] = device_id
+    db_path = tmp_path / "test_state.db"
+    db = SessionDB(db_path=db_path)
+    mp._moonpie_db = db
+    db.register_moonpie_device(device_id, name="Test", public_key="pk", pairing_code="PC")
+    db.confirm_moonpie_device(device_id)
+    db.store_moonpie_device_token(token, device_id)
     return token
 
 
@@ -71,7 +79,7 @@ class TestConversations:
             conv_id = data["id"]
 
             # Verify directly in SessionDB
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             row = tmp_db.get_moonpie_conversation(conv_id, device_id)
             assert row is not None
             assert row["title"] == "New Conversation"
@@ -85,7 +93,7 @@ class TestConversations:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             tmp_db.create_moonpie_conversation(device_id, title="Alpha")
             tmp_db.create_moonpie_conversation(device_id, title="Beta")
 
@@ -105,7 +113,7 @@ class TestConversations:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             for i in range(5):
                 tmp_db.create_moonpie_conversation(device_id, title=f"Conv-{i}")
 
@@ -137,7 +145,7 @@ class TestConversations:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             tmp_db.create_moonpie_conversation(device_id, title="Project Alpha")
             tmp_db.create_moonpie_conversation(device_id, title="Project Beta")
             tmp_db.create_moonpie_conversation(device_id, title="Unrelated")
@@ -155,7 +163,7 @@ class TestConversations:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             cid = tmp_db.create_moonpie_conversation(device_id, title="Keep")
             cid_arch = tmp_db.create_moonpie_conversation(device_id, title="Archive Me")
             tmp_db.archive_moonpie_conversation(cid_arch)
@@ -173,10 +181,12 @@ class TestConversations:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_a = _device_tokens[valid_token]
+            device_a = 'moonpie-test-device'
             token_b = "mpdt-test-token-b"
             device_b = "moonpie-device-b"
-            _device_tokens[token_b] = device_b
+            mp._moonpie_db.register_moonpie_device(device_b, name="B", public_key="pk", pairing_code="PB")
+            mp._moonpie_db.confirm_moonpie_device(device_b)
+            mp._moonpie_db.store_moonpie_device_token(token_b, device_b)
 
             tmp_db.create_moonpie_conversation(device_a, title="A-only")
             tmp_db.create_moonpie_conversation(device_b, title="B-only")
@@ -203,7 +213,7 @@ class TestJobs:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             tmp_db.create_moonpie_job(device_id, title="Job-A", status="running")
             tmp_db.create_moonpie_job(device_id, title="Job-B", status="completed")
 
@@ -220,7 +230,7 @@ class TestJobs:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             tmp_db.create_moonpie_job(device_id, title="Running", status="running")
             tmp_db.create_moonpie_job(device_id, title="Done", status="completed")
 
@@ -237,7 +247,7 @@ class TestJobs:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             for i in range(5):
                 tmp_db.create_moonpie_job(device_id, title=f"Job-{i}")
 
@@ -257,10 +267,12 @@ class TestJobs:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_a = _device_tokens[valid_token]
+            device_a = 'moonpie-test-device'
             token_b = "mpdt-test-token-job-b"
             device_b = "moonpie-job-b"
-            _device_tokens[token_b] = device_b
+            mp._moonpie_db.register_moonpie_device(device_b, name="B", public_key="pk", pairing_code="PB")
+            mp._moonpie_db.confirm_moonpie_device(device_b)
+            mp._moonpie_db.store_moonpie_device_token(token_b, device_b)
 
             tmp_db.create_moonpie_job(device_a, title="A-job")
             tmp_db.create_moonpie_job(device_b, title="B-job")
@@ -282,7 +294,7 @@ class TestApprovals:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             tmp_db.create_moonpie_approval(
                 device_id, session_key="sk", command="rm -rf /", description="Danger",
             )
@@ -302,7 +314,7 @@ class TestApprovals:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_id = _device_tokens[valid_token]
+            device_id = 'moonpie-test-device'
             aid1 = tmp_db.create_moonpie_approval(device_id, "sk", "cmd1", "desc1")
             aid2 = tmp_db.create_moonpie_approval(device_id, "sk", "cmd2", "desc2")
             tmp_db.resolve_moonpie_approval(aid2, status="resolved", action="deny")
@@ -320,10 +332,12 @@ class TestApprovals:
         original_db = mp._moonpie_db
         mp._moonpie_db = tmp_db
         try:
-            device_a = _device_tokens[valid_token]
+            device_a = 'moonpie-test-device'
             token_b = "mpdt-test-token-aprv-b"
             device_b = "moonpie-aprv-b"
-            _device_tokens[token_b] = device_b
+            mp._moonpie_db.register_moonpie_device(device_b, name="B", public_key="pk", pairing_code="PB")
+            mp._moonpie_db.confirm_moonpie_device(device_b)
+            mp._moonpie_db.store_moonpie_device_token(token_b, device_b)
 
             tmp_db.create_moonpie_approval(device_a, "sk-a", "cmd-a", "desc-a")
             tmp_db.create_moonpie_approval(device_b, "sk-b", "cmd-b", "desc-b")

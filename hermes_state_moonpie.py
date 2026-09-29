@@ -319,3 +319,128 @@ class SessionMoonpieMixin:
             "created_at": row["created_at"],
             "resolved_at": row["resolved_at"],
         }
+
+    # ------------------------------------------------------------------
+    # Devices & Tokens (Gate 8: Gateway Convergence — persistent state)
+    # ------------------------------------------------------------------
+
+    def register_moonpie_device(
+        self, device_id: str, name: str, public_key: str, pairing_code: str,
+    ) -> None:
+        """Insert a pending (unconfirmed) device record."""
+        now = time.time()
+        self._write_sql(
+            "INSERT INTO moonpie_devices "
+            "(id, name, public_key, pairing_code, confirmed, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (device_id, name, public_key, pairing_code, 0, now, now),
+        )
+
+    def confirm_moonpie_device(self, device_id: str) -> int:
+        """Mark a device as confirmed. Returns rows affected (0 or 1)."""
+        now = time.time()
+        return self._write_rowcount(
+            "UPDATE moonpie_devices SET confirmed = 1, updated_at = ? WHERE id = ?",
+            (now, device_id),
+        )
+
+    def get_moonpie_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single device by id (any confirmation state)."""
+        row = self._read_one(
+            "SELECT id, name, public_key, pairing_code, confirmed, created_at, updated_at "
+            "FROM moonpie_devices WHERE id = ?",
+            (device_id,),
+        )
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "public_key": row["public_key"],
+            "pairing_code": row["pairing_code"],
+            "confirmed": bool(row["confirmed"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_moonpie_devices(self, *, confirmed_only: bool = True) -> List[Dict[str, Any]]:
+        """Return device records, optionally filtering to confirmed only."""
+        sql = (
+            "SELECT id, name, public_key, pairing_code, confirmed, created_at, updated_at "
+            "FROM moonpie_devices"
+        )
+        params: List[Any] = []
+        if confirmed_only:
+            sql += " WHERE confirmed = 1"
+        sql += " ORDER BY updated_at DESC"
+        rows = self._read_all(sql, params)
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "public_key": row["public_key"],
+                "pairing_code": row["pairing_code"],
+                "confirmed": bool(row["confirmed"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def delete_moonpie_device(self, device_id: str) -> int:
+        """Delete a device and its tokens (CASCADE). Returns rows affected."""
+        return self._write_rowcount(
+            "DELETE FROM moonpie_devices WHERE id = ?",
+            (device_id,),
+        )
+
+    def store_moonpie_device_token(
+        self, token: str, device_id: str, expires_at: Optional[float] = None,
+    ) -> None:
+        """Insert a token for a device."""
+        now = time.time()
+        self._write_sql(
+            "INSERT INTO moonpie_device_tokens (token, device_id, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (token, device_id, now, expires_at),
+        )
+
+    def get_moonpie_device_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """Fetch a token record by token string."""
+        row = self._read_one(
+            "SELECT token, device_id, created_at, expires_at "
+            "FROM moonpie_device_tokens WHERE token = ?",
+            (token,),
+        )
+        if row is None:
+            return None
+        return {
+            "token": row["token"],
+            "device_id": row["device_id"],
+            "created_at": row["created_at"],
+            "expires_at": row["expires_at"],
+        }
+
+    def delete_moonpie_device_token(self, token: str) -> int:
+        """Delete a single token. Returns rows affected."""
+        return self._write_rowcount(
+            "DELETE FROM moonpie_device_tokens WHERE token = ?",
+            (token,),
+        )
+
+    def list_moonpie_device_tokens(self, device_id: str) -> List[Dict[str, Any]]:
+        """Return all tokens for a device."""
+        rows = self._read_all(
+            "SELECT token, device_id, created_at, expires_at "
+            "FROM moonpie_device_tokens WHERE device_id = ?",
+            (device_id,),
+        )
+        return [
+            {
+                "token": row["token"],
+                "device_id": row["device_id"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+            }
+            for row in rows
+        ]
