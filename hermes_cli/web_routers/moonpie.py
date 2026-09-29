@@ -16,7 +16,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from hermes_cli.moonpie_adapter import MoonPieHermesAdapter
@@ -222,9 +222,54 @@ async def device_verify(req: DeviceVerifyRequest):
     return DeviceVerifyResponse(device_token=token)
 
 
+def _require_operator_auth(request: Request):
+    """Verify the caller has a valid dashboard session or is an existing trusted device.
+
+    Accepts:
+    - Bearer token from an already-registered device (trusted-device vouches)
+    - Bearer token from a valid dashboard session
+    - Session cookie from a valid dashboard session
+    """
+    from hermes_cli.dashboard_auth.request_utils import extract_bearer
+    from hermes_cli.dashboard_auth.cookies import read_session_cookies
+
+    bearer = extract_bearer(request)
+    if bearer:
+        # Existing device token is a trusted authority
+        if bearer in _device_tokens:
+            return {"type": "device", "device_id": _device_tokens[bearer]}
+
+        # Dashboard session token
+        from hermes_cli.dashboard_auth import list_session_providers
+        for provider in list_session_providers():
+            try:
+                session = provider.verify_session(access_token=bearer)
+                if session:
+                    return session
+            except Exception:
+                continue
+
+    # Dashboard session cookie
+    at, _rt = read_session_cookies(request)
+    if at:
+        from hermes_cli.dashboard_auth import list_session_providers
+        for provider in list_session_providers():
+            try:
+                session = provider.verify_session(access_token=at)
+                if session:
+                    return session
+            except Exception:
+                continue
+
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
 @router.post("/devices/{device_id}/confirm")
-async def device_confirm(device_id: str):
-    """Confirm a pending device pairing (called by the dashboard / CLI)."""
+async def device_confirm(device_id: str, request: Request, _session=Depends(_require_operator_auth)):
+    """Confirm a pending device pairing (called by the dashboard / CLI).
+
+    Requires a valid trusted authority: existing device token or dashboard session.
+    """
     pending = _pending_pairings.get(device_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Device not found or pairing expired")

@@ -173,6 +173,132 @@ class TestRestAuth:
 
 
 # ---------------------------------------------------------------------------
+# Device Pairing Confirmation Auth Tests (Regression)
+# ---------------------------------------------------------------------------
+
+class TestDeviceConfirmAuth:
+    """Device pairing confirmation must require a trusted authority (Gate 1 regression)."""
+
+    def test_confirm_unauthenticated_returns_401(self, client):
+        """Public self-confirmation without any auth must fail."""
+        # Register a device
+        resp = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Test", "public_key": "pk"},
+        )
+        device_id = resp.json()["device_id"]
+
+        # Attempt to confirm without auth
+        resp = client.post(f"/api/moonpie/devices/{device_id}/confirm")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Authentication required"
+
+    def test_confirm_invalid_token_returns_401(self, client):
+        """Confirmation with an invalid/untrusted token must fail."""
+        resp = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Test", "public_key": "pk"},
+        )
+        device_id = resp.json()["device_id"]
+
+        resp = client.post(
+            f"/api/moonpie/devices/{device_id}/confirm",
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Authentication required"
+
+    def test_confirm_with_valid_device_token_succeeds(self, client, device_token_store):
+        """An existing trusted device can confirm a new device pairing."""
+        # Seed a root/trusted device token
+        device_token_store["mpdt-root-token"] = "root-device"
+
+        # Register a new device
+        resp = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Test", "public_key": "pk"},
+        )
+        data = resp.json()
+        device_id = data["device_id"]
+        pairing_code = data["pairing_code"]
+
+        # Confirm using the trusted device token
+        resp = client.post(
+            f"/api/moonpie/devices/{device_id}/confirm",
+            headers={"Authorization": "Bearer mpdt-root-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        # Verify succeeds after confirmation
+        resp = client.post(
+            "/api/moonpie/devices/verify",
+            json={"device_id": device_id, "pairing_code": pairing_code},
+        )
+        assert resp.status_code == 200
+        token = resp.json()["device_token"]
+        assert token.startswith("mpdt-")
+
+    def test_verify_before_confirm_fails(self, client):
+        """Exchanging pairing code before confirmation must fail."""
+        resp = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Test", "public_key": "pk"},
+        )
+        data = resp.json()
+        device_id = data["device_id"]
+        pairing_code = data["pairing_code"]
+
+        resp = client.post(
+            "/api/moonpie/devices/verify",
+            json={"device_id": device_id, "pairing_code": pairing_code},
+        )
+        assert resp.status_code == 403
+        assert "not yet confirmed" in resp.json()["detail"].lower()
+
+    def test_full_flow_token_auth_login(self, client, device_token_store):
+        """Token from verified device successfully authenticates via WebSocket auth.login."""
+        # Seed root token for confirmation
+        device_token_store["mpdt-root-token"] = "root-device"
+
+        # Register
+        resp = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Test", "public_key": "pk"},
+        )
+        data = resp.json()
+        device_id = data["device_id"]
+        pairing_code = data["pairing_code"]
+
+        # Confirm with root token
+        client.post(
+            f"/api/moonpie/devices/{device_id}/confirm",
+            headers={"Authorization": "Bearer mpdt-root-token"},
+        )
+
+        # Verify
+        resp = client.post(
+            "/api/moonpie/devices/verify",
+            json={"device_id": device_id, "pairing_code": pairing_code},
+        )
+        token = resp.json()["device_token"]
+
+        # Store the token and authenticate via WebSocket
+        device_token_store[token] = device_id
+
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({
+                "jsonrpc": "2.0",
+                "id": "auth-1",
+                "method": "auth.login",
+                "params": {"device_token": token},
+            })
+            msg = ws.receive_json()
+            assert msg["result"]["status"] == "authenticated"
+            assert msg["result"]["device_id"] == device_id
+
+
+# ---------------------------------------------------------------------------
 # WebSocket Authentication Tests
 # ---------------------------------------------------------------------------
 

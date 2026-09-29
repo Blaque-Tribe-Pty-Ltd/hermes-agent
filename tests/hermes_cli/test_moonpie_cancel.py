@@ -163,8 +163,13 @@ class TestWebSocketCancelRouting:
         device_id = data["device_id"]
         pairing_code = data["pairing_code"]
 
-        # Confirm
-        client.post(f"/api/moonpie/devices/{device_id}/confirm")
+        # Confirm (requires auth from an existing trusted device)
+        from hermes_cli.web_routers import moonpie as mp
+        mp._device_tokens["mpdt-root-token"] = "root-device"
+        client.post(
+            f"/api/moonpie/devices/{device_id}/confirm",
+            headers={"Authorization": "Bearer mpdt-root-token"},
+        )
 
         # Verify
         resp = client.post("/api/moonpie/devices/verify", json={
