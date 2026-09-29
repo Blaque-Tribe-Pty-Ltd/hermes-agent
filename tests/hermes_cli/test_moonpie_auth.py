@@ -177,39 +177,50 @@ class TestRestAuth:
 # ---------------------------------------------------------------------------
 
 class TestWebSocketAuth:
-    """WebSocket authentication boundary."""
+    """WebSocket authentication boundary (Gate 1.1 message-based auth)."""
 
-    def test_ws_no_auth_rejected(self, client):
-        """Unauthenticated WebSocket connection is rejected."""
-        with pytest.raises(Exception):
-            with client.websocket_connect("/api/moonpie/ws") as ws:
-                # Should not reach here; connection should be closed
-                ws.receive_text()
+    # Note: Gate 1.1 changed WebSocket auth from query-string to message-based.
+    # The connection is always accepted; authentication happens via auth.login.
+    # These tests verify the new contract.  Old query-string tests removed.
 
-    def test_ws_invalid_token_rejected(self, client):
-        """Invalid token → connection rejected."""
-        with pytest.raises(Exception):
-            with client.websocket_connect("/api/moonpie/ws?token=invalid") as ws:
-                ws.receive_text()
-
-    def test_ws_valid_token_connects(self, client, valid_token):
-        """Valid token → connection established with authenticated device_id."""
-        with client.websocket_connect(f"/api/moonpie/ws?device_token={valid_token}") as ws:
+    def test_ws_connection_accepted_without_token(self, client):
+        """WebSocket connection is accepted even without credentials."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            # Connection accepted; protected ops are rejected, not the socket
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "ping"})
             msg = json.loads(ws.receive_text())
-            assert msg["jsonrpc"] == "2.0"
-            assert msg["method"] == "connection.ready"
-            assert msg["params"]["device_id"] == "moonpie-test-device"
-            # Must NOT be a guest- or fallback- ID
-            assert not msg["params"]["device_id"].startswith("guest-")
-            assert not msg["params"]["device_id"].startswith("fallback-")
+            assert msg["error"]["code"] == -32003
 
-    def test_ws_no_guest_id_generated(self, client):
-        """Unauthenticated connection must not receive a guest-* ID."""
-        with pytest.raises(Exception):
-            with client.websocket_connect("/api/moonpie/ws") as ws:
-                msg = json.loads(ws.receive_text())
-                # Should not reach here
-                assert False, "Connection should have been rejected"
+    def test_ws_query_token_ignored(self, client, valid_token):
+        """Query-string token does NOT authenticate; auth.login required."""
+        with client.websocket_connect(f"/api/moonpie/ws?device_token={valid_token}") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+            msg = json.loads(ws.receive_text())
+            assert msg["error"]["code"] == -32003
+
+    def test_ws_auth_login_flow(self, client, valid_token):
+        """Valid auth.login → authenticated state → connection.ready."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg1 = json.loads(ws.receive_text())
+            assert msg1["result"]["status"] == "authenticated"
+            assert msg1["result"]["device_id"] == "moonpie-test-device"
+
+            msg2 = json.loads(ws.receive_text())
+            assert msg2["method"] == "connection.ready"
+            assert msg2["params"]["device_id"] == "moonpie-test-device"
+            # Must NOT be a guest- or fallback- ID
+            assert not msg2["params"]["device_id"].startswith("guest-")
+            assert not msg2["params"]["device_id"].startswith("fallback-")
+
+    def test_ws_no_guest_id_after_auth(self, client, valid_token):
+        """Authenticated device_id must never be a synthetic guest/fallback ID."""
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({"jsonrpc": "2.0", "id": 1, "method": "auth.login", "params": {"device_token": valid_token}})
+            msg = json.loads(ws.receive_text())
+            device_id = msg["result"]["device_id"]
+            assert not device_id.startswith("guest")
+            assert not device_id.startswith("fallback")
 
 
 # ---------------------------------------------------------------------------
