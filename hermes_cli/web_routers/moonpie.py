@@ -613,6 +613,21 @@ async def _moonpie_loop(conn: _MoonPieConnection):
 
             session_tokens = []
             try:
+                # Gate 5: Tool visibility — wire tool lifecycle events to the client.
+                def tool_event_callback(event_type: str, event_data: dict) -> None:
+                    """Sync callback from the agent thread; bridge to async WebSocket."""
+                    asyncio.run_coroutine_threadsafe(
+                        conn.send_json({
+                            "jsonrpc": "2.0",
+                            "method": event_type,
+                            "params": {
+                                **event_data,
+                                "conversation_id": conversation_id,
+                            },
+                        }),
+                        loop,
+                    )
+
                 # Bind the gateway approval context so dangerous-command guards
                 # route approval requests to this MoonPie session.
                 session_tokens = set_session_vars(
@@ -621,7 +636,11 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     async_delivery=True,
                 )
                 set_current_session_key(conn.session_key)
-                final_response = await _moonpie_adapter.chat(content, stream_callback=stream_callback)
+                final_response = await _moonpie_adapter.chat(
+                    content,
+                    stream_callback=stream_callback,
+                    tool_event_callback=tool_event_callback,
+                )
 
                 # If the model didn't stream deltas, send one full delta now so the
                 # client has content to render before the complete notification.

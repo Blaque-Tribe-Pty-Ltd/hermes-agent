@@ -54,13 +54,17 @@ class MoonPieHermesAdapter:
         self,
         content: str,
         stream_callback: Callable[[str], None],
+        tool_event_callback: Callable[[str, dict], None] | None = None,
     ) -> str:
         """Send *content* to the agent and stream deltas via *stream_callback*.
+
+        Optional *tool_event_callback* receives normalized MoonPie tool lifecycle
+        events: ``tool.started``, ``tool.completed``, ``tool.failed``.
 
         Returns the final response string.  Raises ``RuntimeError`` if the
         agent is not available.
         """
-        agent = await self._get_agent()
+        agent = await self._get_agent(tool_event_callback=tool_event_callback)
         if agent is None:
             raise RuntimeError("Agent not available")
 
@@ -119,13 +123,21 @@ class MoonPieHermesAdapter:
     # Private — Hermes-specific internals
     # ------------------------------------------------------------------
 
-    async def _get_agent(self) -> Optional[Any]:
+    async def _get_agent(
+        self, tool_event_callback: Callable[[str, dict], None] | None = None
+    ) -> Optional[Any]:
         """Lazily initialise a shared ``AIAgent`` for MoonPie clients."""
         if self._agent is not None:
+            # If a tool_event_callback was provided but the agent already exists,
+            # wire it dynamically for this turn only.
+            if tool_event_callback is not None:
+                self._wire_tool_callbacks(self._agent, tool_event_callback)
             return self._agent
 
         async with self._lock:
             if self._agent is not None:
+                if tool_event_callback is not None:
+                    self._wire_tool_callbacks(self._agent, tool_event_callback)
                 return self._agent
 
             try:
@@ -172,6 +184,8 @@ class MoonPieHermesAdapter:
                         )
 
                 self._agent = await asyncio.to_thread(_init)
+                if tool_event_callback is not None:
+                    self._wire_tool_callbacks(self._agent, tool_event_callback)
                 _log.info(
                     "MoonPie agent initialized: provider=%s model=%s",
                     getattr(self._agent, "provider", "?"),
@@ -182,3 +196,72 @@ class MoonPieHermesAdapter:
                 self._agent = None
 
         return self._agent
+
+    @staticmethod
+    def _wire_tool_callbacks(
+        agent: Any,
+        tool_event_callback: Callable[[str, dict], None],
+    ) -> None:
+        """Wire Hermes tool callbacks into normalized MoonPie tool events.
+
+        The adapter normalizes at the boundary so the router never sees
+        Hermes-specific shapes.
+        """
+        import time
+
+        _start_times: dict[str, float] = {}
+
+        def _on_tool_start(call_id: str, tool_name: str, args: dict) -> None:
+            _start_times[call_id] = time.time()
+            # Sanitize: drop any args that might contain secrets
+            preview = tool_name
+            tool_event_callback(
+                "tool.started",
+                {
+                    "tool_call_id": call_id,
+                    "tool_name": tool_name,
+                    "preview": preview,
+                },
+            )
+
+        def _on_tool_complete(
+            call_id: str, tool_name: str, args: dict, result: Any
+        ) -> None:
+            started_at = _start_times.pop(call_id, None)
+            duration_ms = (
+                int((time.time() - started_at) * 1000)
+                if started_at is not None
+                else None
+            )
+            # Detect failure from result shape
+            is_error = False
+            error_message = None
+            if isinstance(result, dict):
+                is_error = bool(result.get("error")) or result.get("status") == "error"
+                error_message = result.get("error", result.get("message"))
+            elif isinstance(result, str) and result.startswith("Error:"):
+                is_error = True
+                error_message = result
+
+            if is_error:
+                tool_event_callback(
+                    "tool.failed",
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": tool_name,
+                        "duration_ms": duration_ms,
+                        "error_message": error_message or "Tool execution failed",
+                    },
+                )
+            else:
+                tool_event_callback(
+                    "tool.completed",
+                    {
+                        "tool_call_id": call_id,
+                        "tool_name": tool_name,
+                        "duration_ms": duration_ms,
+                    },
+                )
+
+        agent.tool_start_callback = _on_tool_start
+        agent.tool_complete_callback = _on_tool_complete
