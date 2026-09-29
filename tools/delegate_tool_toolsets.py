@@ -75,14 +75,20 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     )
 
 def _resolve_child_toolsets(
-    parent_agent, toolsets: Optional[List[str]], effective_role: str
+    parent_agent, toolsets: Optional[List[str]], effective_role: str,
+    profile_toolsets: Optional[List[str]] = None,
 ) -> tuple[List[str], List[str]]:
     """``(enabled_toolsets, disabled_toolsets)`` for a child. Children never gain tools the parent lacks: explicit
     ``toolsets`` are intersected with the parent's (composite-expanded) set, else the parent's enabled set is
     inherited. Blocked tools are stripped twice — whole blocked toolsets here, and exact one-tool deny toolsets via
     ``disabled_toolsets`` so blocked names inside mixed bundles (hermes-cli) are subtracted AFTER composite
     expansion and survive registry refreshes. Orchestrators get ``delegation`` re-added unconditionally
-    (role-granted, not inherited)."""
+    (role-granted, not inherited).
+
+    When ``profile_toolsets`` is provided (profile-aware delegation), the child receives the profile's
+    configured toolsets intersected with the parent's available tools, minus global delegation blocks.
+    Parent-only tools are NOT automatically added.
+    """
     # enabled_toolsets=None means "all tools", so derive from loaded tool names.
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
     if parent_enabled is not None:
@@ -95,7 +101,12 @@ def _resolve_child_toolsets(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if profile_toolsets is not None:
+        # Profile-aware: start with profile toolsets, intersect with parent's available tools
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = [t for t in profile_toolsets if t in expanded_parent]
+        # Do NOT append parent-only MCP toolsets when profile is explicit
+    elif toolsets:
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
         if _get_inherit_mcp_toolsets():
