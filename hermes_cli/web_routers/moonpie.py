@@ -17,7 +17,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from hermes_cli.web_routers._common import http_failure, require, _config_profile_scope
@@ -166,13 +166,13 @@ _device_tokens: Dict[str, str] = {}  # token -> device_id
 # Auth helper
 # ---------------------------------------------------------------------------
 
-def _bearer_token_from_header(authorization: str = "") -> str:
+def _bearer_token_from_header(authorization: str) -> str:
     if authorization.lower().startswith("bearer "):
         return authorization[7:]
     return ""
 
 
-def _authenticate_device(authorization: str = "") -> str:
+def _authenticate_device(authorization: str = Header(default="")) -> str:
     token = _bearer_token_from_header(authorization)
     if not token:
         raise HTTPException(status_code=401, detail="Missing authorization header")
@@ -262,7 +262,7 @@ async def device_confirm(device_id: str):
 async def list_conversations(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    authorization: str = "",
+    authorization: str = Header(default=""),
 ):
     device_id = _authenticate_device(authorization)
     _log.debug("list_conversations for %s", device_id)
@@ -271,7 +271,7 @@ async def list_conversations(
 
 
 @router.post("/conversations", response_model=ConversationDetail)
-async def create_conversation(authorization: str = ""):
+async def create_conversation(authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     conv_id = f"conv-{uuid.uuid4().hex[:12]}"
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -286,7 +286,7 @@ async def create_conversation(authorization: str = ""):
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetail)
-async def get_conversation(conversation_id: str, authorization: str = ""):
+async def get_conversation(conversation_id: str, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.debug("get_conversation %s for %s", conversation_id, device_id)
     # TODO: Query SessionDB
@@ -301,7 +301,7 @@ async def get_conversation(conversation_id: str, authorization: str = ""):
 async def list_jobs(
     status: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
-    authorization: str = "",
+    authorization: str = Header(default=""),
 ):
     device_id = _authenticate_device(authorization)
     _log.debug("list_jobs for %s", device_id)
@@ -310,7 +310,7 @@ async def list_jobs(
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetail)
-async def get_job(job_id: str, authorization: str = ""):
+async def get_job(job_id: str, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.debug("get_job %s for %s", job_id, device_id)
     # TODO: Query job state
@@ -318,7 +318,7 @@ async def get_job(job_id: str, authorization: str = ""):
 
 
 @router.get("/jobs/{job_id}/diff")
-async def get_job_diff(job_id: str, authorization: str = ""):
+async def get_job_diff(job_id: str, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.debug("get_job_diff %s for %s", job_id, device_id)
     # TODO: Return job diff
@@ -330,7 +330,7 @@ async def get_job_diff(job_id: str, authorization: str = ""):
 # ---------------------------------------------------------------------------
 
 @router.get("/approvals", response_model=List[ApprovalSummary])
-async def list_approvals(authorization: str = ""):
+async def list_approvals(authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.debug("list_approvals for %s", device_id)
     # TODO: Query pending approvals from approval queue
@@ -338,7 +338,7 @@ async def list_approvals(authorization: str = ""):
 
 
 @router.post("/approvals/{approval_id}/respond")
-async def respond_approval(approval_id: str, req: ApprovalRespondRequest, authorization: str = ""):
+async def respond_approval(approval_id: str, req: ApprovalRespondRequest, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.info("MoonPie approval response: %s action=%s from %s", approval_id, req.action, device_id)
     # TODO: Route to the running agent / kanban system
@@ -382,21 +382,14 @@ async def moonpie_websocket(websocket: WebSocket):
     if token:
         device_id = _device_tokens.get(token)
 
-    # Fallbacks during development: accept any token, and allow guest when absent
-    # (TODO: tighten once full device registration flow is implemented)
-    if not device_id and token:
-        device_id = f"fallback-{token[:8]}"
-    if not device_id and not token:
-        device_id = f"guest-{uuid.uuid4().hex[:8]}"
-
-    # If still no device id, wait once for an auth.login message
+    # If no valid device id from query param, wait for an auth.login message
     if not device_id:
         try:
             msg = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
             data = json.loads(msg)
             if data.get("method") == "auth.login":
                 token = data.get("params", {}).get("device_token", "")
-                device_id = _device_tokens.get(token) or (f"fallback-{token[:8]}" if token else None)
+                device_id = _device_tokens.get(token)
         except asyncio.TimeoutError:
             await websocket.close(code=4001, reason="Authentication timeout")
             return
@@ -655,3 +648,24 @@ async def broadcast_to_all(payload: dict):
     """Push a JSON-RPC notification to every connected MoonPie device."""
     for conn in list(_moonpie_connections.values()):
         await conn.send_json({"jsonrpc": "2.0", "method": payload["method"], "params": payload.get("params", {})})
+
+# ---------------------------------------------------------------------------
+# Token-auth integration
+# ---------------------------------------------------------------------------
+
+from hermes_cli.dashboard_auth.moonpie_provider import MoonPieDeviceProvider
+from hermes_cli.dashboard_auth.registry import register_global_provider
+from hermes_cli.dashboard_auth.token_auth import register_token_route
+
+# Inject the verify callback so the provider can validate device tokens
+MoonPieDeviceProvider.set_verify_callback(lambda token: _device_tokens.get(token))
+
+# Register the provider with the dashboard auth system
+register_global_provider(MoonPieDeviceProvider())
+
+# Register exact-match REST paths as token-authable so the middleware
+# validates the Authorization header before the cookie gate.
+# Dynamic paths (e.g. /conversations/{id}) are validated by the handler.
+register_token_route("/api/moonpie/conversations")
+register_token_route("/api/moonpie/jobs")
+register_token_route("/api/moonpie/approvals")
