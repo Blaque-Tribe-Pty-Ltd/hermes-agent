@@ -154,12 +154,6 @@ class TestWebSocketCancelRouting:
     @pytest.fixture
     def auth_ws(self, client):
         """Register a device and open an authenticated WebSocket."""
-        from hermes_cli.web_routers import moonpie as mp
-        # Seed root token for confirmation
-        mp._moonpie_db.register_moonpie_device("root-device", name="Root", public_key="pk-root", pairing_code="ROOT")
-        mp._moonpie_db.confirm_moonpie_device("root-device")
-        mp._moonpie_db.store_moonpie_device_token("mpdt-root-token", "root-device")
-
         # Register
         resp = client.post("/api/moonpie/devices/register", json={
             "name": "Test Device",
@@ -169,10 +163,12 @@ class TestWebSocketCancelRouting:
         device_id = data["device_id"]
         pairing_code = data["pairing_code"]
 
-        # Confirm (requires auth from an existing trusted device)
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        # Confirm through the dashboard operator boundary.
         client.post(
             f"/api/moonpie/devices/{device_id}/confirm",
-            headers={"Authorization": "Bearer mpdt-root-token"},
+            headers={_SESSION_HEADER_NAME: _SESSION_TOKEN},
         )
 
         # Verify

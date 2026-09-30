@@ -28,4 +28,8 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # MoonPie macOS client WebSocket. Auth is handled inside the handler via
     # device_token query param + auth.login message; no dashboard session needed.
     "/api/moonpie/ws",
+    # Native-client bootstrap. Registration creates only a short-lived pending
+    # request; verify succeeds only after an authenticated operator approval.
+    "/api/moonpie/devices/register",
+    "/api/moonpie/devices/verify",
 })

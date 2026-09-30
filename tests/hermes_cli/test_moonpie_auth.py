@@ -192,7 +192,7 @@ class TestDeviceConfirmAuth:
         # Attempt to confirm without auth
         resp = client.post(f"/api/moonpie/devices/{device_id}/confirm")
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "Authentication required"
+        assert resp.json()["detail"] == "Unauthorized"
 
     def test_confirm_invalid_token_returns_401(self, client):
         """Confirmation with an invalid/untrusted token must fail."""
@@ -207,10 +207,10 @@ class TestDeviceConfirmAuth:
             headers={"Authorization": "Bearer invalid-token"},
         )
         assert resp.status_code == 401
-        assert resp.json()["detail"] == "Authentication required"
+        assert resp.json()["detail"] == "Unauthorized"
 
-    def test_confirm_with_valid_device_token_succeeds(self, client, device_token_store):
-        """An existing trusted device can confirm a new device pairing."""
+    def test_confirm_with_valid_device_token_is_rejected(self, client, device_token_store):
+        """A device credential is not an operator credential."""
         # Seed a root/trusted device token
         device_token_store.register_moonpie_device("root-device", name="Root", public_key="pk", pairing_code="ROOT")
         device_token_store.confirm_moonpie_device("root-device")
@@ -223,24 +223,110 @@ class TestDeviceConfirmAuth:
         )
         data = resp.json()
         device_id = data["device_id"]
-        pairing_code = data["pairing_code"]
-
-        # Confirm using the trusted device token
+        # A trusted client still cannot approve another client.
         resp = client.post(
             f"/api/moonpie/devices/{device_id}/confirm",
             headers={"Authorization": "Bearer mpdt-root-token"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is True
+        assert resp.status_code == 401
 
-        # Verify succeeds after confirmation
-        resp = client.post(
-            "/api/moonpie/devices/verify",
-            json={"device_id": device_id, "pairing_code": pairing_code},
+    def test_dashboard_operator_can_confirm_and_list(self, client):
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        registered = client.post(
+            "/api/moonpie/devices/register",
+            json={
+                "name": "Operator Test",
+                "model": "MacBookPro18,2",
+                "os_version": "15.1",
+                "public_key": "pk",
+            },
+        ).json()
+        headers = {_SESSION_HEADER_NAME: _SESSION_TOKEN}
+
+        pending = client.get("/api/moonpie/devices/pending", headers=headers)
+        assert pending.status_code == 200
+        assert pending.json() == [{
+            "device_id": registered["device_id"],
+            "name": "Operator Test",
+            "model": "MacBookPro18,2",
+            "os_version": "15.1",
+            "confirmed": False,
+            "created_at": pending.json()[0]["created_at"],
+        }]
+
+        confirmed = client.post(
+            f"/api/moonpie/devices/{registered['device_id']}/confirm", headers=headers,
         )
-        assert resp.status_code == 200
-        token = resp.json()["device_token"]
-        assert token.startswith("mpdt-")
+        assert confirmed.status_code == 200
+
+        verified = client.post(
+            "/api/moonpie/devices/verify",
+            json={
+                "device_id": registered["device_id"],
+                "pairing_code": registered["pairing_code"],
+            },
+        )
+        assert verified.status_code == 200
+        assert verified.json()["expires_in"] == 90 * 24 * 60 * 60
+
+        replay = client.post(
+            "/api/moonpie/devices/verify",
+            json={
+                "device_id": registered["device_id"],
+                "pairing_code": registered["pairing_code"],
+            },
+        )
+        assert replay.status_code == 404
+
+    def test_pairing_code_and_device_token_are_hashed_at_rest(self, client, device_token_store):
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        registered = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Hash Test", "public_key": "pk"},
+        ).json()
+        row = device_token_store._read_one(
+            "SELECT pairing_code FROM moonpie_devices WHERE id = ?",
+            (registered["device_id"],),
+        )
+        assert row["pairing_code"].startswith("pbkdf2_sha256$")
+        assert registered["pairing_code"] not in row["pairing_code"]
+
+        headers = {_SESSION_HEADER_NAME: _SESSION_TOKEN}
+        client.post(f"/api/moonpie/devices/{registered['device_id']}/confirm", headers=headers)
+        verified = client.post(
+            "/api/moonpie/devices/verify",
+            json={"device_id": registered["device_id"], "pairing_code": registered["pairing_code"]},
+        ).json()
+        token_row = device_token_store._read_one(
+            "SELECT token, expires_at FROM moonpie_device_tokens WHERE device_id = ?",
+            (registered["device_id"],),
+        )
+        assert token_row["token"].startswith("sha256$")
+        assert verified["device_token"] not in token_row["token"]
+        assert token_row["expires_at"] > 0
+
+    def test_expired_pairing_is_not_listed_or_confirmed(self, client, device_token_store):
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        registered = client.post(
+            "/api/moonpie/devices/register",
+            json={"name": "Expired", "public_key": "pk"},
+        ).json()
+        device_token_store._write_sql(
+            "UPDATE moonpie_devices SET pairing_expires_at = ? WHERE id = ?",
+            (0, registered["device_id"]),
+        )
+        headers = {_SESSION_HEADER_NAME: _SESSION_TOKEN}
+
+        listed = client.get("/api/moonpie/devices", headers=headers)
+        assert listed.status_code == 200
+        assert listed.json() == []
+        confirmed = client.post(
+            f"/api/moonpie/devices/{registered['device_id']}/confirm", headers=headers,
+        )
+        assert confirmed.status_code == 410
 
     def test_verify_before_confirm_fails(self, client):
         """Exchanging pairing code before confirmation must fail."""
@@ -261,11 +347,6 @@ class TestDeviceConfirmAuth:
 
     def test_full_flow_token_auth_login(self, client, device_token_store):
         """Token from verified device successfully authenticates via WebSocket auth.login."""
-        # Seed a root/trusted device token
-        device_token_store.register_moonpie_device("root-device", name="Root", public_key="pk", pairing_code="ROOT")
-        device_token_store.confirm_moonpie_device("root-device")
-        device_token_store.store_moonpie_device_token("mpdt-root-token", "root-device")
-
         # Register
         resp = client.post(
             "/api/moonpie/devices/register",
@@ -275,10 +356,12 @@ class TestDeviceConfirmAuth:
         device_id = data["device_id"]
         pairing_code = data["pairing_code"]
 
-        # Confirm with root token
+        from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        # Confirm with the dashboard operator token.
         client.post(
             f"/api/moonpie/devices/{device_id}/confirm",
-            headers={"Authorization": "Bearer mpdt-root-token"},
+            headers={_SESSION_HEADER_NAME: _SESSION_TOKEN},
         )
 
         # Verify

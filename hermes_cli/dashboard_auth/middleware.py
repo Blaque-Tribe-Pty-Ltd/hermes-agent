@@ -41,10 +41,9 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/native/refresh", "/auth/password-login", "/auth/logout", "/login",
     "/api/auth/providers", "/api/mcp/oauth/callback/",
     "/assets/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/",
-    # MoonPie REST and WebSocket routes: auth is enforced by the handler, not
-    # the cookie gate. Exact-match routes are ALSO registered as token routes
-    # for defense-in-depth validation by the token-auth middleware.
-    "/api/moonpie/")
+    # MoonPie native-client data routes authenticate device bearer tokens in
+    # their handlers. Device management remains behind the operator gate.
+    "/api/moonpie/conversations/", "/api/moonpie/jobs/", "/api/moonpie/approvals/")
 
 
 def _path_is_public(path: str) -> bool:
