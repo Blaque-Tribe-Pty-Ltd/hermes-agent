@@ -35,6 +35,7 @@ import {
   Globe,
   Heart,
   KeyRound,
+  Laptop,
   Menu,
   MessageSquare,
   Package,
@@ -93,6 +94,7 @@ const SkillsPage = lazy(() => import("@/pages/SkillsPage"));
 const PluginsPage = lazy(() => import("@/pages/PluginsPage"));
 const McpPage = lazy(() => import("@/pages/McpPage"));
 const PairingPage = lazy(() => import("@/pages/PairingPage"));
+const DevicesPage = lazy(() => import("@/pages/DevicesPage"));
 const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
@@ -167,6 +169,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/plugins": PluginsPage,
   "/mcp": McpPage,
   "/pairing": PairingPage,
+  "/devices": DevicesPage,
   "/channels": ChannelsPage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
@@ -213,6 +216,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/channels", label: "Channels", icon: Radio },
   { path: "/webhooks", label: "Webhooks", icon: Webhook },
   { path: "/pairing", label: "Pairing", icon: ShieldCheck },
+  { path: "/devices", label: "Devices", icon: Laptop },
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },

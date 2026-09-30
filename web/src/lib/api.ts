@@ -1227,6 +1227,16 @@ export const api = {
       method: "POST",
     }),
 
+  // ── Admin: MoonPie Devices ────────────────────────────────────────────
+  getMoonPieDevices: () => fetchJSON<MoonPieDevice[]>("/api/moonpie/devices"),
+  getMoonPiePendingDevices: () =>
+    fetchJSON<MoonPieDevice[]>("/api/moonpie/devices/pending"),
+  confirmMoonPieDevice: (device_id: string) =>
+    fetchJSON<{ ok: boolean; device_id: string }>(
+      `/api/moonpie/devices/${encodeURIComponent(device_id)}/confirm`,
+      { method: "POST" }
+    ),
+
   // ── Admin: Webhooks ─────────────────────────────────────────────────
   getWebhooks: () => fetchJSON<WebhooksResponse>("/api/webhooks"),
   enableWebhooks: () =>
@@ -1725,6 +1735,15 @@ export interface PairingUser {
 export interface PairingResponse {
   pending: PairingUser[];
   approved: PairingUser[];
+}
+
+export interface MoonPieDevice {
+  device_id: string;
+  name: string;
+  model: string;
+  os_version: string;
+  confirmed: boolean;
+  created_at: string;
 }
 
 export interface WebhookRoute {

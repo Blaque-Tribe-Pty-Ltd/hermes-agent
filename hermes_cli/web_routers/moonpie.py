@@ -278,6 +278,56 @@ async def device_confirm(device_id: str, request: Request, _session=Depends(_req
 
 
 # ---------------------------------------------------------------------------
+# Device management (dashboard / operator)
+# ---------------------------------------------------------------------------
+
+class MoonPieDeviceSummary(BaseModel):
+    device_id: str
+    name: str
+    model: str = ""
+    os_version: str = ""
+    confirmed: bool
+    created_at: str
+
+
+@router.get("/devices", response_model=List[MoonPieDeviceSummary])
+async def list_devices(request: Request, _session=Depends(_require_operator_auth)):
+    """List all MoonPie devices (pending and confirmed)."""
+    db = _get_moonpie_db()
+    rows = db.list_moonpie_devices(confirmed_only=False)
+    return [
+        MoonPieDeviceSummary(
+            device_id=r["device_id"],
+            name=r["name"],
+            model=r.get("model", ""),
+            os_version=r.get("os_version", ""),
+            confirmed=bool(r.get("confirmed")),
+            created_at=_ts_to_iso(r["created_at"]),
+        )
+        for r in rows
+    ]
+
+
+@router.get("/devices/pending", response_model=List[MoonPieDeviceSummary])
+async def list_pending_devices(request: Request, _session=Depends(_require_operator_auth)):
+    """List pending (unconfirmed) MoonPie devices."""
+    db = _get_moonpie_db()
+    rows = db.list_moonpie_devices(confirmed_only=False)
+    pending = [r for r in rows if not r.get("confirmed")]
+    return [
+        MoonPieDeviceSummary(
+            device_id=r["device_id"],
+            name=r["name"],
+            model=r.get("model", ""),
+            os_version=r.get("os_version", ""),
+            confirmed=False,
+            created_at=_ts_to_iso(r["created_at"]),
+        )
+        for r in pending
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
 
