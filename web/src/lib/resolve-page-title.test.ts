@@ -39,8 +39,8 @@ describe("resolvePageTitle", () => {
     expect(resolvePageTitle("/whatever", t, [])).toBe("Whatever");
   });
 
-  it("treats root as sessions and trailing slashes as equivalent", () => {
-    expect(resolvePageTitle("/", t, [])).toBe("Sessions");
+  it("treats root as cockpit and trailing slashes as equivalent", () => {
+    expect(resolvePageTitle("/", t, [])).toBe("Home");
     expect(resolvePageTitle("/mcp/", t, [])).toBe("MCP");
   });
 });
