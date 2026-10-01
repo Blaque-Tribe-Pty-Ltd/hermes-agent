@@ -87,6 +87,19 @@ def _truncate(text: str, limit: int) -> str:
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
+# Detectable markers for binding user/orchestrator decisions in a task's
+# comment thread. When present, auto-specify/decompose must leave the card in
+# triage untouched rather than rewriting its body/title or promoting it.
+_BINDING_HEADER_RE = re.compile(
+    r"(?im)^"
+    r"(?:"
+    r"#+\s*(?:DECISION|STOP|BINDING|AUTHORITY|APPROVAL)"
+    r"|"
+    r"(?:DECISION|STOP|BINDING|AUTHORITY|APPROVAL)\s*(?:—|:|-)"
+    r")"
+)
+_STOP_CONDITION_RE = re.compile(r"(?i)\bSTOP\s+conditions?\b")
+
 
 def _extract_json_blob(raw: str, fence_re: re.Pattern = _FENCE_RE) -> Optional[dict]:
     """Lenient JSON object extraction: strip code fences, take the first ``{``
@@ -132,6 +145,28 @@ def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
     if task.status != "triage":
         return None, f"task is not in triage (status={task.status!r})"
     return task, ""
+
+
+def _has_binding_constraint(task_id: str) -> bool:
+    """True when the task's comment thread contains a binding user/orchestrator
+    decision marker. Auto-specify/decompose must skip such cards so STOP
+    conditions, authority boundaries, approval requirements and other binding
+    constraints survive triage untouched.
+
+    Markers are intentional, detectable headers: ``## DECISION``, ``## STOP``,
+    ``DECISION —``, ``STOP:``, ``STOP condition(s)``, and the like.
+    """
+    with kbc.connect_closing() as conn:
+        comments = kb.list_comments(conn, task_id)
+    for comment in comments:
+        body = (comment.body or "").strip()
+        if not body:
+            continue
+        if _BINDING_HEADER_RE.search(body):
+            return True
+        if _STOP_CONDITION_RE.search(body):
+            return True
+    return False
 
 
 def _task_prompt_fields(task: kb.Task) -> dict[str, str]:
@@ -194,11 +229,18 @@ def specify_task(
     timeout: Optional[int] = None,
 ) -> SpecifyOutcome:
     """Specify one triage task and promote it to ``todo``. Expected failures
-    (not in triage, no aux client, API error, malformed reply) surface as
-    ``ok=False`` so an ``--all`` sweep continues."""
+    (not in triage, binding user constraint in comments, no aux client, API
+    error, malformed reply) surface as ``ok=False`` so an ``--all`` sweep
+    continues."""
     task, reason = _load_triage_task(task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
+
+    if _has_binding_constraint(task_id):
+        return SpecifyOutcome(
+            task_id, False,
+            "binding user constraint in comment thread; leaving in triage for human orchestration",
+        )
 
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,

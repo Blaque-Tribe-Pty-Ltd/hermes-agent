@@ -256,3 +256,72 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_skips_when_binding_decision_comment_present(kanban_home):
+    """A binding user/orchestrator decision in the comment thread must prevent
+    auto-decompose from rewriting the card or promoting it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", body="original body", triage=True)
+        kb.add_comment(conn, tid, "orchestrator", "## DECISION \u2014 Ziggy: do not fan out.")
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "would split",
+        "tasks": [{"title": "child", "body": "child body", "assignee": "engineer", "parents": []}],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "binding user constraint" in outcome.reason.lower()
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        children = kb.child_ids(conn, tid)
+    assert task.status == "triage"
+    assert task.title == "rough idea"
+    assert task.body == "original body"
+    assert not children
+
+
+def test_decompose_skips_on_stop_condition_comment(kanban_home):
+    """Explicit STOP condition language must also block auto-decompose."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough idea", triage=True)
+        kb.add_comment(
+            conn, tid, "neo",
+            "STOP conditions: if habitat reconstruction does not reproduce 11/11, "
+            "return the discrepancy rather than adapting the PR.",
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened",
+        "body": "Rewritten.",
+    })
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "binding user constraint" in outcome.reason.lower()
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
