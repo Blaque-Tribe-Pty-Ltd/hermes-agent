@@ -243,10 +243,46 @@ export const defaultLargeTheme: DashboardTheme = {
   },
 };
 
+/**
+ * MoonPie — warm amber/cream cockpit theme tuned for the dashboard redesign.
+ * Higher contrast than default teal, with a mission-control feel.
+ */
+export const moonpieTheme: DashboardTheme = {
+  name: "moonpie",
+  label: "MoonPie",
+  description: "Warm amber cockpit — the MoonPie-native dashboard look",
+  palette: {
+    background: { hex: "#0c0a09", alpha: 1 },
+    midground: { hex: "#f59e0b", alpha: 1 },
+    foreground: { hex: "#fff7ed", alpha: 0 },
+    warmGlow: "rgba(245, 158, 11, 0.25)",
+    noiseOpacity: 0.8,
+  },
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"Inter", ${SYSTEM_SANS}`,
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
+    fontUrl:
+      "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap",
+    letterSpacing: "-0.005em",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "0.625rem",
+  },
+  colorOverrides: {
+    success: "#22c55e",
+    warning: "#f59e0b",
+    destructive: "#ef4444",
+  },
+  swatchColors: ["#0c0a09", "#f59e0b", "rgba(245, 158, 11, 0.25)"],
+};
+
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   default: defaultTheme,
   "default-large": defaultLargeTheme,
   "nous-blue": nousBlueTheme,
+  moonpie: moonpieTheme,
   midnight: midnightTheme,
   ember: emberTheme,
   mono: monoTheme,

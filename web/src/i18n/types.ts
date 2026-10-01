@@ -105,6 +105,15 @@ export interface Translations {
       plugins: string;
       sessions: string;
       skills: string;
+      /** Optional section labels — fall back to English literals until translated. */
+      diagnostics?: string;
+      files?: string;
+      home?: string;
+      knowledge?: string;
+      moonpie?: string;
+      network?: string;
+      reference?: string;
+      system?: string;
     };
     modelToolsSheetSubtitle: string;
     modelToolsSheetTitle: string;
@@ -724,6 +733,43 @@ export interface Translations {
       clipboard_unsupported: string;
       tweet_text: string;
     };
+  };
+
+  // ── Cockpit / Home page ──
+  cockpit?: {
+    title: string;
+    search: string;
+    openCommandPalette: string;
+    activeSessions: string;
+    gatewayStatus: string;
+    tokensToday: string;
+    costToday: string;
+    recentActivity: string;
+    quickActions: string;
+    systemHealth: string;
+    cronSchedules: string;
+    skillsPlugins: string;
+    noRecentActivity: string;
+    startFirstConversation: string;
+    openChat: string;
+    newSession: string;
+    checkLogs: string;
+    restartGateway: string;
+    browseSkills: string;
+    viewConfig: string;
+    channelsHealthy: string;
+    modelsConfigured: string;
+    cpuCores: string;
+    latestError: string;
+    loadingError: string;
+    retry: string;
+    today: string;
+    active: string;
+    since: string;
+    running: string;
+    healthy: string;
+    next: string;
+    overdue: string;
   };
 
   // ── Kanban ──

@@ -431,6 +431,17 @@ def _has_valid_session_token(request: Request) -> bool:
 # the OS shell / a new tab, where no header can be set). Kept narrow.
 _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
 
+_HANDLER_AUTHENTICATED_API_PREFIXES: tuple[str, ...] = (
+    "/api/moonpie/conversations",
+    "/api/moonpie/jobs",
+    "/api/moonpie/approvals",
+)
+
+
+def _is_handler_authenticated_api_path(path: str) -> bool:
+    return any(path == prefix or path.startswith(f"{prefix}/")
+               for prefix in _HANDLER_AUTHENTICATED_API_PREFIXES)
+
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
     if path not in _QUERY_TOKEN_API_PATHS:
@@ -671,6 +682,7 @@ async def auth_middleware(request: Request, call_next):
         and not getattr(request.app.state, "auth_required", False)
         and path.startswith("/api/")
         and path not in _PUBLIC_API_PATHS
+        and not _is_handler_authenticated_api_path(path)
         and not path.startswith("/api/mcp/oauth/callback/")
         and not _has_valid_session_token(request)
         and not _has_valid_query_token(request, path)

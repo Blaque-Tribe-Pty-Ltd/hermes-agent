@@ -25,6 +25,9 @@ from hermes_state import SessionDB
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter(prefix="/api/moonpie")
 
+_PAIRING_TTL_SECONDS = 300
+_DEVICE_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60
+
 
 # Lazy SessionDB handle — one per process; thread-safe via WAL.
 _moonpie_db: Optional[SessionDB] = None
@@ -77,7 +80,7 @@ class DeviceRegisterRequest(BaseModel):
 class DeviceRegisterResponse(BaseModel):
     device_id: str
     pairing_code: str
-    expires_in: int = 300
+    expires_in: int = _PAIRING_TTL_SECONDS
 
 
 class DeviceVerifyRequest(BaseModel):
@@ -88,7 +91,7 @@ class DeviceVerifyRequest(BaseModel):
 class DeviceVerifyResponse(BaseModel):
     device_token: str
     token_type: str = "Bearer"
-    expires_in: int = 7776000  # 90 days
+    expires_in: int = _DEVICE_TOKEN_TTL_SECONDS
 
 
 class ConversationSummary(BaseModel):
@@ -184,95 +187,71 @@ async def device_register(req: DeviceRegisterRequest):
     db.register_moonpie_device(
         device_id=device_id,
         name=req.name,
+        model=req.model,
+        os_version=req.os_version,
         public_key=req.public_key,
         pairing_code=pairing_code,
+        pairing_expires_at=time.time() + _PAIRING_TTL_SECONDS,
     )
 
     _log.info("MoonPie device registered: %s (%s)", device_id, req.name)
     return DeviceRegisterResponse(
         device_id=device_id,
         pairing_code=pairing_code,
-        expires_in=300,
+        expires_in=_PAIRING_TTL_SECONDS,
     )
 
 
 @router.post("/devices/verify", response_model=DeviceVerifyResponse)
 async def device_verify(req: DeviceVerifyRequest):
-    """Exchange a confirmed pairing code for a long-lived device JWT."""
+    """Exchange a confirmed pairing code for a long-lived opaque device token."""
     db = _get_moonpie_db()
-    device = db.get_moonpie_device(req.device_id)
-    if not device:
+    result = db.consume_moonpie_pairing_code(req.device_id, req.pairing_code)
+    if result == "missing":
         raise HTTPException(status_code=404, detail="Device not found or pairing expired")
-
-    if device.get("pairing_code") != req.pairing_code:
+    if result == "expired":
+        raise HTTPException(status_code=410, detail="Pairing expired")
+    if result == "invalid":
         raise HTTPException(status_code=400, detail="Invalid pairing code")
-
-    if not device.get("confirmed"):
+    if result == "unconfirmed":
         raise HTTPException(status_code=403, detail="Pairing not yet confirmed by user")
 
-    # Generate device JWT (placeholder — replace with real JWT signing)
     token = f"mpdt-{uuid.uuid4().hex}"
-    db.store_moonpie_device_token(token, req.device_id)
+    db.store_moonpie_device_token(
+        token, req.device_id, expires_at=time.time() + _DEVICE_TOKEN_TTL_SECONDS,
+    )
 
     _log.info("MoonPie device verified: %s", req.device_id)
     return DeviceVerifyResponse(device_token=token)
 
 
 def _require_operator_auth(request: Request):
-    """Verify the caller has a valid dashboard session or is an existing trusted device.
+    """Require the dashboard's existing operator authentication boundary."""
+    from hermes_cli.web_server import _require_token
 
-    Accepts:
-    - Bearer token from an already-registered device (trusted-device vouches)
-    - Bearer token from a valid dashboard session
-    - Session cookie from a valid dashboard session
-    """
-    from hermes_cli.dashboard_auth.request_utils import extract_bearer
-    from hermes_cli.dashboard_auth.cookies import read_session_cookies
-
-    bearer = extract_bearer(request)
-    if bearer:
-        # Existing device token is a trusted authority
-        device_id = _verify_device_token(bearer)
-        if device_id:
-            return {"type": "device", "device_id": device_id}
-
-        # Dashboard session token
-        from hermes_cli.dashboard_auth import list_session_providers
-        for provider in list_session_providers():
-            try:
-                session = provider.verify_session(access_token=bearer)
-                if session:
-                    return session
-            except Exception:
-                continue
-
-    # Dashboard session cookie
-    at, _rt = read_session_cookies(request)
-    if at:
-        from hermes_cli.dashboard_auth import list_session_providers
-        for provider in list_session_providers():
-            try:
-                session = provider.verify_session(access_token=at)
-                if session:
-                    return session
-            except Exception:
-                continue
-
-    raise HTTPException(status_code=401, detail="Authentication required")
+    _require_token(request)
+    return getattr(request.state, "session", None) or {"type": "local_dashboard"}
 
 
 @router.post("/devices/{device_id}/confirm")
 async def device_confirm(device_id: str, request: Request, _session=Depends(_require_operator_auth)):
     """Confirm a pending device pairing (called by the dashboard / CLI).
 
-    Requires a valid trusted authority: existing device token or dashboard session.
+    Requires an authenticated dashboard operator. Device tokens cannot approve
+    another device.
     """
     db = _get_moonpie_db()
     device = db.get_moonpie_device(device_id)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found or pairing expired")
 
-    db.confirm_moonpie_device(device_id)
+    expires_at = device.get("pairing_expires_at")
+    if expires_at is None or expires_at < time.time():
+        raise HTTPException(status_code=410, detail="Pairing expired")
+    if device.get("confirmed"):
+        return {"ok": True, "device_id": device_id}
+    if db.confirm_moonpie_device(device_id) != 1:
+        raise HTTPException(status_code=409, detail="Pairing could not be confirmed")
     _log.info("MoonPie device pairing confirmed: %s", device_id)
     return {"ok": True, "device_id": device_id}
 
@@ -295,16 +274,22 @@ async def list_devices(request: Request, _session=Depends(_require_operator_auth
     """List all MoonPie devices (pending and confirmed)."""
     db = _get_moonpie_db()
     rows = db.list_moonpie_devices(confirmed_only=False)
+    now = time.time()
+    visible = [
+        r for r in rows
+        if r.get("confirmed")
+        or (r.get("pairing_expires_at") is not None and r["pairing_expires_at"] >= now)
+    ]
     return [
         MoonPieDeviceSummary(
-            device_id=r["device_id"],
+            device_id=r["id"],
             name=r["name"],
             model=r.get("model", ""),
             os_version=r.get("os_version", ""),
             confirmed=bool(r.get("confirmed")),
             created_at=_ts_to_iso(r["created_at"]),
         )
-        for r in rows
+        for r in visible
     ]
 
 
@@ -313,10 +298,16 @@ async def list_pending_devices(request: Request, _session=Depends(_require_opera
     """List pending (unconfirmed) MoonPie devices."""
     db = _get_moonpie_db()
     rows = db.list_moonpie_devices(confirmed_only=False)
-    pending = [r for r in rows if not r.get("confirmed")]
+    now = time.time()
+    pending = [
+        r for r in rows
+        if not r.get("confirmed")
+        and r.get("pairing_expires_at") is not None
+        and r["pairing_expires_at"] >= now
+    ]
     return [
         MoonPieDeviceSummary(
-            device_id=r["device_id"],
+            device_id=r["id"],
             name=r["name"],
             model=r.get("model", ""),
             os_version=r.get("os_version", ""),

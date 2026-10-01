@@ -21,41 +21,14 @@ import {
   useNavigate,
 } from "react-router";
 import {
-  Activity,
-  BarChart3,
-  BookOpen,
-  Clock,
-  Code,
-  Cpu,
-  Database,
   Download,
-  Eye,
-  FolderOpen,
-  FileText,
-  Globe,
-  Heart,
-  KeyRound,
-  Laptop,
+  Home,
   Menu,
-  MessageSquare,
-  Package,
   PanelLeftClose,
   PanelLeftOpen,
-  Plug,
-  Puzzle,
-  Radio,
   RotateCw,
-  Settings,
-  Shield,
-  ShieldCheck,
-  Sparkles,
-  Star,
-  Terminal,
-  Users,
-  Webhook,
-  Wrench,
+  Search,
   X,
-  Zap,
 } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { SelectionSwitcher } from "@nous-research/ui/ui/components/selection-switcher";
@@ -63,9 +36,18 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { cn } from "@/lib/utils";
+import { CommandPalette } from "@/components/CommandPalette";
 import { SidebarFooter } from "@/components/SidebarFooter";
 import { SidebarStatusStrip, gatewayLine } from "@/components/SidebarStatusStrip";
 import { useBelowBreakpoint } from "@nous-research/ui/hooks/use-below-breakpoint";
+import {
+  BUILTIN_NAV_SECTIONS,
+  CHAT_NAV_ITEM,
+  buildSectionedNav,
+  sectionContainsPath,
+  type NavItem,
+  type NavSection,
+} from "@/lib/navigation";
 import { useSidebarStatus } from "@/hooks/useSidebarStatus";
 import { AuthWidget } from "@/components/AuthWidget";
 import { PageHeaderProvider } from "@/contexts/PageHeaderProvider";
@@ -83,6 +65,7 @@ const ConfigPage = lazy(() => import("@/pages/ConfigPage"));
 const DocsPage = lazy(() => import("@/pages/DocsPage"));
 const EnvPage = lazy(() => import("@/pages/EnvPage"));
 const FilesPage = lazy(() => import("@/pages/FilesPage"));
+const HomePage = lazy(() => import("@/pages/HomePage"));
 const SessionsPage = lazy(() => import("@/pages/SessionsPage"));
 const LogsPage = lazy(() => import("@/pages/LogsPage"));
 const AnalyticsPage = lazy(() => import("@/pages/AnalyticsPage"));
@@ -127,10 +110,6 @@ function RouteFallback({ label = "Loading…" }: { label?: string }) {
   );
 }
 
-function RootRedirect() {
-  return <Navigate to="/sessions" replace />;
-}
-
 function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
   if (pluginsLoading) {
     // Render nothing during the plugin-load window — a spinner here would just flash.
@@ -138,13 +117,6 @@ function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
   }
   return <Navigate to="/sessions" replace />;
 }
-
-const CHAT_NAV_ITEM: NavItem = {
-  path: "/chat",
-  labelKey: "chat",
-  label: "Chat",
-  icon: Terminal,
-};
 
 /**
  * Built-in routes except /chat.  Chat is rendered persistently (outside
@@ -158,7 +130,7 @@ const CHAT_NAV_ITEM: NavItem = {
  * keep working.
  */
 const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
-  "/": RootRedirect,
+  "/": HomePage,
   "/sessions": SessionsPage,
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
@@ -186,128 +158,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
 // fire when the user navigates to /chat.
 function ChatRouteSink() {
   return null;
-}
-
-const BUILTIN_NAV_REST: NavItem[] = [
-  {
-    path: "/sessions",
-    labelKey: "sessions",
-    label: "Sessions",
-    icon: MessageSquare,
-  },
-  { path: "/files", label: "Files", icon: FolderOpen },
-  {
-    path: "/analytics",
-    labelKey: "analytics",
-    label: "Analytics",
-    icon: BarChart3,
-  },
-  {
-    path: "/models",
-    labelKey: "models",
-    label: "Models",
-    icon: Cpu,
-  },
-  { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
-  { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
-  { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
-  { path: "/plugins", labelKey: "plugins", label: "Plugins", icon: Puzzle },
-  { path: "/mcp", label: "MCP", icon: Plug },
-  { path: "/channels", label: "Channels", icon: Radio },
-  { path: "/webhooks", label: "Webhooks", icon: Webhook },
-  { path: "/pairing", label: "Pairing", icon: ShieldCheck },
-  { path: "/devices", label: "Devices", icon: Laptop },
-  { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
-  { path: "/config", labelKey: "config", label: "Config", icon: Settings },
-  { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
-  { path: "/system", label: "System", icon: Wrench },
-  {
-    path: "/docs",
-    labelKey: "documentation",
-    label: "Documentation",
-    icon: BookOpen,
-  },
-];
-
-const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
-  Activity,
-  BarChart3,
-  Clock,
-  Cpu,
-  FileText,
-  FolderOpen,
-  KeyRound,
-  MessageSquare,
-  Package,
-  Settings,
-  Puzzle,
-  Sparkles,
-  Terminal,
-  Globe,
-  Database,
-  Shield,
-  Users,
-  Wrench,
-  Zap,
-  Heart,
-  Star,
-  Code,
-  Eye,
-};
-
-function resolveIcon(name: string): ComponentType<{ className?: string }> {
-  return ICON_MAP[name] ?? Puzzle;
-}
-
-function buildNavItems(
-  builtIn: NavItem[],
-  manifests: PluginManifest[],
-): NavItem[] {
-  const items = [...builtIn];
-
-  for (const manifest of manifests) {
-    if (manifest.tab.override) continue;
-    if (manifest.tab.hidden) continue;
-
-    const pluginItem: NavItem = {
-      path: manifest.tab.path,
-      label: manifest.label,
-      icon: resolveIcon(manifest.icon),
-    };
-
-    const pos = manifest.tab.position ?? "end";
-    if (pos === "end") {
-      items.push(pluginItem);
-    } else if (pos.startsWith("after:")) {
-      const target = "/" + pos.slice(6);
-      const idx = items.findIndex((i) => i.path === target);
-      items.splice(idx >= 0 ? idx + 1 : items.length, 0, pluginItem);
-    } else if (pos.startsWith("before:")) {
-      const target = "/" + pos.slice(7);
-      const idx = items.findIndex((i) => i.path === target);
-      items.splice(idx >= 0 ? idx : items.length, 0, pluginItem);
-    } else {
-      items.push(pluginItem);
-    }
-  }
-
-  return items;
-}
-
-/** Split merged nav into built-in sidebar entries vs plugin tabs, preserving plugin order hints. */
-function partitionSidebarNav(
-  builtIn: NavItem[],
-  manifests: PluginManifest[],
-): { coreItems: NavItem[]; pluginItems: NavItem[] } {
-  const merged = buildNavItems(builtIn, manifests);
-  const builtinPaths = new Set(builtIn.map((i) => i.path));
-  const coreItems: NavItem[] = [];
-  const pluginItems: NavItem[] = [];
-  for (const item of merged) {
-    if (builtinPaths.has(item.path)) coreItems.push(item);
-    else pluginItems.push(item);
-  }
-  return { coreItems, pluginItems };
 }
 
 function buildRoutes(
@@ -382,6 +232,9 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const openPalette = useCallback(() => setPaletteOpen(true), []);
+  const closePalette = useCallback(() => setPaletteOpen(false), []);
 
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -462,19 +315,19 @@ export default function App() {
     [embeddedChat],
   );
 
-  const builtinNav = useMemo(() => {
-    const base = embeddedChat
-      ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
-      : BUILTIN_NAV_REST;
-    return showTokenAnalytics
-      ? base
-      : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+  const sections = useMemo(() => {
+    const base = [...BUILTIN_NAV_SECTIONS];
+    if (embeddedChat) {
+      base[0] = { ...base[0], items: [CHAT_NAV_ITEM, ...base[0].items] };
+    }
+    if (!showTokenAnalytics) {
+      for (const section of base) {
+        section.items = section.items.filter((item) => item.path !== "/analytics");
+      }
+    }
+    return buildSectionedNav(base, manifests);
+  }, [embeddedChat, manifests, showTokenAnalytics]);
 
-  const sidebarNav = useMemo(
-    () => partitionSidebarNav(builtinNav, manifests),
-    [builtinNav, manifests],
-  );
   const routes = useMemo(
     () => buildRoutes(builtinRoutes, manifests),
     [builtinRoutes, manifests],
@@ -514,6 +367,22 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((prev) => !prev);
+      }
+      if (mod && e.key.toLowerCase() === "b" && !isMobile) {
+        e.preventDefault();
+        toggleCollapsed();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [isMobile, toggleCollapsed]);
 
   return (
     <ProfileProvider>
@@ -559,6 +428,16 @@ export default function App() {
         <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
           {t.app.brand}
         </Typography>
+
+        <Button
+          ghost
+          size="icon"
+          onClick={openPalette}
+          aria-label={t.cockpit?.openCommandPalette ?? "Open command palette"}
+          className="ml-auto text-text-secondary hover:text-midground"
+        >
+          <Search className="h-4 w-4" />
+        </Button>
       </header>
 
       {mobileOpen && (
@@ -661,48 +540,41 @@ export default function App() {
               aria-label={t.app.navigation}
             >
               <ul className="flex flex-col">
-                {sidebarNav.coreItems.map((item) => (
-                  <SidebarNavLink
-                    closeMobile={closeMobile}
-                    collapsed={isDesktopCollapsed}
-                    item={item}
-                    key={item.path}
-                    t={t}
-                    tooltipWarmRef={tooltipWarmRef}
-                  />
-                ))}
+                <SidebarNavLink
+                  closeMobile={closeMobile}
+                  collapsed={isDesktopCollapsed}
+                  item={{
+                    path: "/",
+                    labelKey: "home",
+                    label: "Home",
+                    icon: Home,
+                  }}
+                  key="home"
+                  t={t}
+                  tooltipWarmRef={tooltipWarmRef}
+                />
               </ul>
 
-              {sidebarNav.pluginItems.length > 0 && (
-                <div
-                  aria-labelledby="hermes-sidebar-plugin-nav-heading"
-                  className="flex flex-col border-t border-current/10 pb-2"
-                  role="group"
-                >
-                  <span
-                    className={cn(
-                      "px-5 pt-2.5 pb-1",
-                      "font-sans text-display text-xs tracking-[0.12em] text-text-tertiary",
-                      isDesktopCollapsed && "lg:hidden",
-                    )}
-                    id="hermes-sidebar-plugin-nav-heading"
-                  >
-                    {t.app.pluginNavSection}
-                  </span>
+              {sections.sections.map((section) => (
+                <SidebarSection
+                  collapsed={isDesktopCollapsed}
+                  closeMobile={closeMobile}
+                  key={section.id}
+                  section={section}
+                  t={t}
+                  tooltipWarmRef={tooltipWarmRef}
+                />
+              ))}
 
-                  <ul className="flex flex-col">
-                    {sidebarNav.pluginItems.map((item) => (
-                      <SidebarNavLink
-                        closeMobile={closeMobile}
-                        collapsed={isDesktopCollapsed}
-                        item={item}
-                        key={item.path}
-                        t={t}
-                        tooltipWarmRef={tooltipWarmRef}
-                      />
-                    ))}
-                  </ul>
-                </div>
+              {sections.pluginSection && (
+                <SidebarSection
+                  collapsed={isDesktopCollapsed}
+                  closeMobile={closeMobile}
+                  key={sections.pluginSection.id}
+                  section={sections.pluginSection}
+                  t={t}
+                  tooltipWarmRef={tooltipWarmRef}
+                />
               )}
             </nav>
 
@@ -730,6 +602,22 @@ export default function App() {
                 )}
               >
                 <PluginSlot name="header-right" />
+
+                <SidebarIconWithTooltip
+                  collapsed={isDesktopCollapsed}
+                  label={t.cockpit?.openCommandPalette ?? "Open command palette"}
+                  tooltipWarmRef={tooltipWarmRef}
+                >
+                  <Button
+                    ghost
+                    onClick={openPalette}
+                    size="icon"
+                    aria-label={t.cockpit?.openCommandPalette ?? "Open command palette"}
+                    className="text-text-secondary hover:text-midground"
+                  >
+                    <Search className="h-3.5 w-3.5" />
+                  </Button>
+                </SidebarIconWithTooltip>
 
                 <SidebarIconWithTooltip
                   collapsed={isDesktopCollapsed}
@@ -833,6 +721,8 @@ export default function App() {
       </div>
 
       <PluginSlot name="overlay" />
+
+      <CommandPalette onClose={closePalette} open={paletteOpen} />
     </div>
     </ProfileProvider>
   );
@@ -853,6 +743,131 @@ function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
   return <div key={profile || "__own__"} className="contents">{children}</div>;
 }
 
+const SECTIONS_OPEN_KEY = "hermes-sidebar-sections";
+
+function SidebarSection({
+  collapsed,
+  closeMobile,
+  section,
+  t,
+  tooltipWarmRef,
+}: {
+  collapsed: boolean;
+  closeMobile: () => void;
+  section: NavSection;
+  t: Translations;
+  tooltipWarmRef: TooltipWarmRef;
+}) {
+  const { pathname } = useLocation();
+  const sectionLabel =
+    (t.app.nav as Record<string, string>)[section.labelKey] ?? section.label;
+  const SectionIcon = section.icon;
+  const isActive = sectionContainsPath(section, pathname);
+
+  const [open, setOpen] = useState(() => {
+    try {
+      const saved = localStorage.getItem(SECTIONS_OPEN_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as Record<string, boolean>;
+        if (parsed[section.id] !== undefined) return parsed[section.id];
+      }
+    } catch {}
+    return isActive;
+  });
+
+  useEffect(() => {
+    setOpen((prev) => (prev || isActive));
+  }, [isActive]);
+
+  const toggle = useCallback(() => {
+    setOpen((prev) => {
+      const next = !prev;
+      try {
+        const saved = localStorage.getItem(SECTIONS_OPEN_KEY);
+        const parsed = saved ? (JSON.parse(saved) as Record<string, boolean>) : {};
+        parsed[section.id] = next;
+        localStorage.setItem(SECTIONS_OPEN_KEY, JSON.stringify(parsed));
+      } catch {}
+      return next;
+    });
+  }, [section.id]);
+
+  if (collapsed) {
+    return (
+      <div className="flex flex-col border-t border-current/10 py-1">
+        <div className="flex flex-col">
+          {section.items.map((item) => (
+            <SidebarNavLink
+              closeMobile={closeMobile}
+              collapsed={collapsed}
+              item={item}
+              key={item.path}
+              t={t}
+              tooltipWarmRef={tooltipWarmRef}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="flex flex-col border-t border-current/10 py-1"
+      role="group"
+      aria-expanded={open}
+    >
+      <button
+        className={cn(
+          "flex w-full items-center justify-between px-4 py-2 text-left",
+          "text-[11px] font-medium uppercase tracking-[0.14em] text-text-tertiary",
+          "transition-colors hover:text-midground",
+          "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-midground/40",
+          isActive && "text-midground",
+        )}
+        onClick={toggle}
+        type="button"
+      >
+        <span className="flex items-center gap-2">
+          <SectionIcon className="h-3.5 w-3.5" />
+          {sectionLabel}
+        </span>
+        <span
+          className={cn(
+            "transition-transform duration-200",
+            open ? "rotate-180" : "rotate-0",
+          )}
+        >
+          <svg
+            className="h-3 w-3"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            viewBox="0 0 24 24"
+          >
+            <path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </span>
+      </button>
+
+      {open && (
+        <ul className="flex flex-col">
+          {section.items.map((item) => (
+            <SidebarNavLink
+              closeMobile={closeMobile}
+              collapsed={collapsed}
+              item={item}
+              key={item.path}
+              t={t}
+              tooltipWarmRef={tooltipWarmRef}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function SidebarNavLink({
   closeMobile,
   collapsed,
@@ -860,7 +875,8 @@ function SidebarNavLink({
   tooltipWarmRef,
   t,
 }: SidebarNavLinkProps) {
-  const { path, label, labelKey, icon: Icon } = item;
+  const { path, label, labelKey, icon } = item;
+  const Icon = icon ?? (() => null);
   const [hovered, setHovered] = useState(false);
   const [tooltipAnchor, setTooltipAnchor] = useState<HTMLElement | null>(null);
 
@@ -1354,13 +1370,6 @@ interface GatewayDotProps {
   collapsed: boolean;
   status: StatusResponse | null;
   tooltipWarmRef: TooltipWarmRef;
-}
-
-interface NavItem {
-  icon: ComponentType<{ className?: string }>;
-  label: string;
-  labelKey?: string;
-  path: string;
 }
 
 interface SidebarIconWithTooltipProps {

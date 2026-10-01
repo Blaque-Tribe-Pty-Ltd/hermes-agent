@@ -642,8 +642,11 @@ CREATE INDEX IF NOT EXISTS idx_moonpie_approval_device_status
 CREATE TABLE IF NOT EXISTS moonpie_devices (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    os_version TEXT NOT NULL DEFAULT '',
     public_key TEXT,
     pairing_code TEXT,
+    pairing_expires_at REAL,
     confirmed INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
