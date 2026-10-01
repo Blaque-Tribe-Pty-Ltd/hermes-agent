@@ -10,8 +10,8 @@ import {
   AlertTriangle,
   ArrowUpRight,
   BarChart3,
-  Brain,
   CheckCircle2,
+  Cpu,
   FileText,
   LayoutDashboard,
   MessageSquare,
@@ -593,15 +593,15 @@ function SystemHealthCard({
 
           <button
             className="flex items-center justify-between rounded-[var(--radius)] px-2 py-1.5 text-left transition-colors hover:bg-midground/5"
-            onClick={() => navigate("/models")}
+            onClick={() => navigate("/system")}
             type="button"
           >
             <span className="text-sm text-text-secondary">
-              {t.cockpit?.modelsConfigured
-                ? t.cockpit.modelsConfigured.replace("{count}", String(stats?.cpu_count ?? "—"))
-                : `${stats?.cpu_count ?? "—"} configured`}
+              {t.cockpit?.cpuCores
+                ? t.cockpit.cpuCores.replace("{count}", String(stats?.cpu_count ?? "—"))
+                : `${stats?.cpu_count ?? "—"} cores`}
             </span>
-            <Brain className="h-3.5 w-3.5 text-text-tertiary" />
+            <Cpu className="h-3.5 w-3.5 text-text-tertiary" />
           </button>
 
           {stats?.memory && (

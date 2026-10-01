@@ -752,6 +752,7 @@ export const en: Translations = {
     viewConfig: "View Config",
     channelsHealthy: "{healthy}/{total} healthy",
     modelsConfigured: "{count} configured",
+    cpuCores: "{count} cores",
     latestError: "Latest error",
     loadingError: "Unable to load cockpit data.",
     retry: "Retry",

@@ -759,6 +759,7 @@ export interface Translations {
     viewConfig: string;
     channelsHealthy: string;
     modelsConfigured: string;
+    cpuCores: string;
     latestError: string;
     loadingError: string;
     retry: string;
