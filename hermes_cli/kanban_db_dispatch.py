@@ -2516,6 +2516,40 @@ def _hermes_path_argv(path: str) -> list[str]:
     return [_absolute_hermes_path(path)]
 
 
+def _is_executable_bootstrap_launcher(candidate: Path) -> bool:
+    """Return True when ``candidate`` is a non-Python launcher usable as argv[0].
+
+    Bootstrap launchers are native binaries or interpreted wrappers whose
+    shebang is *not* Python.  Plain Python source files (with or without a
+    ``.py`` extension) are rejected: ``sys.executable -m hermes_cli.main`` is
+    the deterministic, interpreter-bound form and avoids invoking a source
+    file that may lack a shebang or use a different Python.
+    """
+    name = candidate.name.lower()
+    if name.endswith((".py", ".pyc", ".pyw")):
+        return False
+    try:
+        with candidate.open("rb") as _f:
+            head = _f.read(256)
+    except (OSError, ValueError):
+        return False
+    if not head:
+        return False
+    if head.startswith(b"#!"):
+        shebang = head.split(b"\n", 1)[0].decode("utf-8", errors="ignore").lower()
+        return "python" not in shebang
+    # Native binary formats; without a shebang anything else is not directly
+    # executable on POSIX.
+    binary_magics = (
+        b"\x7fELF",              # ELF
+        b"MZ",                   # PE / Windows
+        b"\xcf\xfa\xed\xfe",    # Mach-O 64-bit little-endian
+        b"\xfe\xed\xfa\xcf",    # Mach-O 32-bit big-endian
+        b"\xca\xfe\xba\xbe",    # Mach-O fat / universal
+    )
+    return head.startswith(binary_magics)
+
+
 def _resolve_bootstrap_hermes_bin() -> Optional[str]:
     """Locate the bootstrap launcher companion to the running ``hermes_cli``.
 
@@ -2544,7 +2578,7 @@ def _resolve_bootstrap_hermes_bin() -> Optional[str]:
             if (
                 candidate.is_file()
                 and os.access(candidate, os.X_OK)
-                and not candidate.name.lower().endswith((".py", ".pyc", ".pyw"))
+                and _is_executable_bootstrap_launcher(candidate)
             ):
                 return str(candidate)
     except Exception:

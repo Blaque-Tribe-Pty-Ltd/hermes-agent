@@ -1562,6 +1562,10 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+    # The point of this test is PATH-shim vs module-form isolation; a real
+    # bootstrap launcher next to the checkout (e.g. from setup-hermes.sh) is a
+    # separate, higher-priority path and must not shadow the assertion.
+    monkeypatch.setattr(kbd, "_resolve_bootstrap_hermes_bin", lambda: None)
     assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
