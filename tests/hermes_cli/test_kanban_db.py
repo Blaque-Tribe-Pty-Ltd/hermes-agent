@@ -1595,6 +1595,83 @@ def test_resolve_hermes_argv_module_actually_runs():
     )
 
 
+def test_resolve_hermes_argv_prefers_bootstrap_launcher_over_module_form(monkeypatch, tmp_path):
+    """Bootstrap-launcher hosts: a shell wrapper next to the running checkout
+    must win over ``python -m hermes_cli.main`` so workers inherit the same
+    bootstrap environment (#111569 hardening is incompatible with these hosts
+    unless we locate the launcher from the running install)."""
+    import sys
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    fake_checkout = tmp_path / "fake-hermes-agent"
+    fake_bin = fake_checkout / ".hermes" / "bin"
+    fake_bin.mkdir(parents=True)
+    launcher = fake_bin / "hermes"
+    launcher.write_text("#!/bin/sh\nexec python3 -m hermes_cli.main \"$@\"\n")
+    launcher.chmod(0o755)
+
+    fake_hermes_cli = fake_checkout / "hermes_cli"
+    fake_hermes_cli.mkdir()
+    (fake_hermes_cli / "__init__.py").write_text("")
+
+    # Point hermes_cli import at our fake checkout.
+    monkeypatch.syspath_prepend(str(fake_checkout))
+    # Force re-import from the fake checkout.
+    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+    import hermes_cli as _fhc  # noqa: F401
+
+    argv = kbd._resolve_hermes_argv()
+    assert argv == [str(launcher.resolve())]
+
+
+def test_resolve_hermes_argv_hermes_bin_still_wins_over_bootstrap(monkeypatch, tmp_path):
+    """An explicit ``$HERMES_BIN`` remains the highest-priority override, even
+    when a bootstrap launcher is discoverable next to the running checkout."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    fake_checkout = tmp_path / "fake-hermes-agent"
+    fake_bin = fake_checkout / ".hermes" / "bin"
+    fake_bin.mkdir(parents=True)
+    launcher = fake_bin / "hermes"
+    launcher.write_text("#!/bin/sh\nexec python3 -m hermes_cli.main \"$@\"\n")
+    launcher.chmod(0o755)
+
+    fake_hermes_cli = fake_checkout / "hermes_cli"
+    fake_hermes_cli.mkdir()
+    (fake_hermes_cli / "__init__.py").write_text("")
+
+    monkeypatch.syspath_prepend(str(fake_checkout))
+    monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
+    assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
+
+
+def test_resolve_hermes_argv_ignores_python_source_bootstrap(monkeypatch, tmp_path):
+    """A ``.py`` file next to the checkout is not a valid bootstrap launcher;
+    fall back to the module form."""
+    import sys
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    fake_checkout = tmp_path / "fake-hermes-agent"
+    fake_bin = fake_checkout / ".hermes" / "bin"
+    fake_bin.mkdir(parents=True)
+    launcher = fake_bin / "hermes"
+    launcher.write_text("import sys\nsys.exit(0)\n")
+    launcher.chmod(0o755)
+
+    fake_hermes_cli = fake_checkout / "hermes_cli"
+    fake_hermes_cli.mkdir()
+    (fake_hermes_cli / "__init__.py").write_text("")
+
+    monkeypatch.syspath_prepend(str(fake_checkout))
+    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+    import hermes_cli as _fhc  # noqa: F401
+
+    argv = kbd._resolve_hermes_argv()
+    assert argv == [sys.executable, "-m", "hermes_cli.main"]
+
+
 # ---------------------------------------------------------------------------
 # task_age — guard against corrupt timestamp values
 #

@@ -2516,15 +2516,60 @@ def _hermes_path_argv(path: str) -> list[str]:
     return [_absolute_hermes_path(path)]
 
 
+def _resolve_bootstrap_hermes_bin() -> Optional[str]:
+    """Locate the bootstrap launcher companion to the running ``hermes_cli``.
+
+    On bootstrap-launcher installs the real entry point is a shell wrapper
+    next to the checkout (``<checkout>/.hermes/bin/hermes``).  When the running
+    dispatcher was started through such a wrapper, ``hermes_cli`` is imported
+    from that checkout, so we can locate the wrapper without trusting PATH.
+
+    This keeps #111569's "module form over PATH" hardening intact: we never
+    search PATH for a generic ``hermes`` name; we only use a launcher that is
+    byte-adjacent to the running code.
+    """
+    try:
+        import hermes_cli
+
+        module_file = getattr(hermes_cli, "__file__", "")
+        if not module_file:
+            return None
+        checkout = Path(module_file).resolve().parent.parent
+        # hermes_cli package lives directly inside the checkout root.
+        candidates = [
+            checkout / ".hermes" / "bin" / "hermes",
+            checkout / "bin" / "hermes",
+        ]
+        for candidate in candidates:
+            if (
+                candidate.is_file()
+                and os.access(candidate, os.X_OK)
+                and not candidate.name.lower().endswith((".py", ".pyc", ".pyw"))
+            ):
+                return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_hermes_argv() -> list[str]:
-    """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
-    (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
+    """Resolve the ``hermes`` invocation as argv for ``Popen``.
+
+    Resolution order:
+
+    1. ``$HERMES_BIN`` if set (path-like -> absolute; bare names keep PATH
+       semantics, never a same-directory file).
+    2. The bootstrap launcher companion to the running ``hermes_cli``
+       (bootstrap-launcher installs; e.g. ``<checkout>/.hermes/bin/hermes``).
+       This keeps workers on the same install tree as the dispatcher without
+       trusting PATH (#111569).
+    3. The running interpreter's ``sys.executable -m hermes_cli.main``
+       (exactly this install; covers shim-less cron, systemd ``User=``, launchd).
+    4. ``which("hermes")`` (Windows: safe PATH search, batch shims fall back to
+       the module form) only when ``hermes_cli`` is not importable.
+
+    The module argv must still win over a *blind* PATH lookup so an
+    attacker-planted ``hermes`` cannot shadow the running install (#111569).
     Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
     sits below ``gateway`` in the dependency order.
     """
@@ -2539,6 +2584,10 @@ def _resolve_hermes_argv() -> list[str]:
         if resolved_env_bin:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
+
+    bootstrap_bin = _resolve_bootstrap_hermes_bin()
+    if bootstrap_bin:
+        return _hermes_path_argv(bootstrap_bin)
 
     try:
         if importlib.util.find_spec("hermes_cli") is not None:
