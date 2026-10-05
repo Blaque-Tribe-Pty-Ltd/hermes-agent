@@ -67,7 +67,7 @@ class MoonPieHermesAdapter:
 
     async def chat(
         self,
-        content: str,
+        content: Any,
         stream_callback: Callable[[str], None],
         tool_event_callback: Callable[[str, dict], None] | None = None,
         *,
@@ -75,7 +75,7 @@ class MoonPieHermesAdapter:
         conversation_id: str = "",
         session_key: str = "",
     ) -> str:
-        """Send *content* to the agent and stream deltas via *stream_callback*.
+        """Send text or multimodal *content* and stream deltas via *stream_callback*.
 
         Optional *tool_event_callback* receives normalized MoonPie tool lifecycle
         events: ``tool.started``, ``tool.completed``, ``tool.failed``.

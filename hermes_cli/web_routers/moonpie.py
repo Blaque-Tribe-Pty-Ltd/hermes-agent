@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, W
 from pydantic import BaseModel, Field
 
 from hermes_cli.moonpie_adapter import MoonPieHermesAdapter
+from hermes_cli.moonpie_media import build_moonpie_message_content
 from hermes_state import SessionDB
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -675,7 +676,20 @@ async def _moonpie_loop(conn: _MoonPieConnection):
         # -- Protected operations (require authentication) ---------------------
         if method == "conversation.message":
             payload = params.get("payload", {})
-            content = payload.get("text", params.get("content", ""))
+            if not isinstance(payload, dict):
+                payload = {}
+            try:
+                content = build_moonpie_message_content(
+                    payload.get("text", params.get("content", "")),
+                    payload.get("images", params.get("images", [])),
+                )
+            except ValueError as exc:
+                await conn.send_json({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": str(exc)},
+                })
+                continue
             conversation_id = params.get("conversation_id", "")
 
             loop = asyncio.get_running_loop()

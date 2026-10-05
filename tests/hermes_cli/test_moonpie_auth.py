@@ -11,6 +11,7 @@ Verifies:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from unittest.mock import patch
 
@@ -533,6 +534,86 @@ class TestWebSocketAuthLogin:
             msg = json.loads(ws.receive_text())
             assert msg["error"]["code"] == -32003
             assert "Authentication required" in msg["error"]["message"]
+
+    def test_authenticated_image_reaches_agent_as_multimodal_content(
+        self, client, valid_token, monkeypatch
+    ):
+        captured = []
+
+        class FakeAdapter:
+            async def chat(self, content, stream_callback, **_kwargs):
+                captured.append(content)
+                stream_callback("ok")
+                return "ok"
+
+            async def synthesize_speech(self, _text):
+                return None
+
+        monkeypatch.setattr(moonpie_router, "_moonpie_adapter", FakeAdapter())
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({
+                "jsonrpc": "2.0", "id": 1, "method": "auth.login",
+                "params": {"device_token": valid_token},
+            })
+            json.loads(ws.receive_text())
+            json.loads(ws.receive_text())
+            ws.send_json({
+                "jsonrpc": "2.0", "id": 2, "method": "conversation.message",
+                "params": {
+                    "conversation_id": "conversation-1",
+                    "content": "What is shown?",
+                    "images": [{
+                        "name": "screenshot.png",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(png).decode("ascii"),
+                    }],
+                },
+            })
+            json.loads(ws.receive_text())
+            json.loads(ws.receive_text())
+            json.loads(ws.receive_text())
+
+        assert captured[0][0] == {"type": "text", "text": "What is shown?"}
+        assert captured[0][1]["type"] == "image_url"
+        assert captured[0][1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+    def test_invalid_image_is_rejected_before_agent_call(
+        self, client, valid_token, monkeypatch
+    ):
+        class FakeAdapter:
+            async def chat(self, *_args, **_kwargs):
+                raise AssertionError("invalid media must not reach the agent")
+
+        monkeypatch.setattr(moonpie_router, "_moonpie_adapter", FakeAdapter())
+
+        with client.websocket_connect("/api/moonpie/ws") as ws:
+            ws.send_json({
+                "jsonrpc": "2.0", "id": 1, "method": "auth.login",
+                "params": {"device_token": valid_token},
+            })
+            json.loads(ws.receive_text())
+            json.loads(ws.receive_text())
+            ws.send_json({
+                "jsonrpc": "2.0", "id": 2, "method": "conversation.message",
+                "params": {
+                    "conversation_id": "conversation-1",
+                    "content": "Inspect this",
+                    "images": [{
+                        "name": "fake.png",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(b"not an image").decode("ascii"),
+                    }],
+                },
+            })
+            response = json.loads(ws.receive_text())
+
+        assert response["id"] == 2
+        assert response["error"]["code"] == -32602
 
     def test_invalid_auth_login_rejected(self, client):
         """Invalid auth.login credentials are rejected."""
