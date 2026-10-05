@@ -56,7 +56,7 @@ from gateway.session_context import set_session_vars, clear_session_vars
 # Agent integration — delegated to the Hermes adapter (Gate 2, B3)
 # ---------------------------------------------------------------------------
 
-_moonpie_adapter = MoonPieHermesAdapter()
+_moonpie_adapter = MoonPieHermesAdapter(session_db_provider=_get_moonpie_db)
 
 
 def _approval_session_key(device_id: str) -> str:
