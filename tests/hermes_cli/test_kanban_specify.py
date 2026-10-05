@@ -93,6 +93,47 @@ def test_specify_task_happy_path(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+def test_specify_task_skips_when_binding_decision_comment_present(kanban_home):
+    """A binding user/orchestrator decision in the comment thread must prevent
+    auto-specify from rewriting the card or promoting it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", body="original body", triage=True)
+        kb.add_comment(conn, tid, "orchestrator", "## DECISION — Ziggy: stop here.")
+
+    # Even a "would succeed" LLM reply must not be applied.
+    content = jsonlib.dumps({"title": "Refined rough", "body": "rewritten body"})
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is False
+    assert "binding user constraint" in outcome.reason.lower()
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.title == "rough"
+    assert task.body == "original body"
+
+
+def test_specify_task_skips_on_stop_condition_comment(kanban_home):
+    """Explicit STOP condition language must also block auto-specify."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+        kb.add_comment(conn, tid, "neo", "STOP condition: do not publish until approved.")
+
+    content = jsonlib.dumps({"title": "Refined rough", "body": "rewritten body"})
+    p, _ = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is False
+    assert "binding user constraint" in outcome.reason.lower()
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 
 
 

@@ -27,7 +27,8 @@ from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
-    _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
+    _call_aux, _extract_json_blob, _has_binding_constraint, _load_triage_task,
+    _task_prompt_fields, _title_body,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
@@ -307,11 +308,17 @@ def decompose_task(
     timeout: Optional[int] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
-    (not in triage, no aux client, API error, malformed/empty reply) surface
-    as ``ok=False``."""
+    (not in triage, binding user constraint in comments, no aux client, API
+    error, malformed/empty reply) surface as ``ok=False``."""
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    if _has_binding_constraint(task_id):
+        return DecomposeOutcome(
+            task_id, False,
+            "binding user constraint in comment thread; leaving in triage for human orchestration",
+        )
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
