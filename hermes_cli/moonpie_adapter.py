@@ -21,6 +21,7 @@ Design principles:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -49,14 +50,15 @@ class MoonPieHermesAdapter:
     """Minimal adapter isolating Hermes agent interaction from MoonPie router.
 
     Current responsibilities:
-    - Lazy initialisation of a shared ``AIAgent`` for MoonPie clients.
+    - Lazy initialisation of one ``AIAgent`` per MoonPie conversation.
     - ``chat()`` — send a message, stream text deltas, return final response.
     - ``synthesize_speech()`` — synthesise speech audio, return raw bytes.
     - ``cancel_turn()`` — signal cancellation, withdraw approvals, stop streaming (Gate 6, B5).
     """
 
-    def __init__(self) -> None:
-        self._agent: Optional[Any] = None
+    def __init__(self, session_db_provider: Callable[[], Any] | None = None) -> None:
+        self._agents: dict[str, Any] = {}
+        self._session_db_provider = session_db_provider
         self._lock = asyncio.Lock()
         self._turn_lock = threading.Lock()
         self._active_turns: dict[str, _TurnState] = {}
@@ -87,7 +89,18 @@ class MoonPieHermesAdapter:
         while this chat is in flight, subsequent deltas and tool events are dropped
         and the turn returns early.
         """
-        agent = await self._get_agent(tool_event_callback=tool_event_callback)
+        if not device_id or not conversation_id:
+            raise RuntimeError("MoonPie device and conversation IDs are required")
+        session_id = self._session_id(device_id, conversation_id)
+        session_db = self._get_session_db()
+        agent = await self._get_agent(
+            session_id,
+            session_db,
+            session_key=session_key,
+            device_id=device_id,
+            conversation_id=conversation_id,
+            tool_event_callback=tool_event_callback,
+        )
         if agent is None:
             raise RuntimeError("Agent not available")
 
@@ -108,7 +121,17 @@ class MoonPieHermesAdapter:
             from hermes_cli.web_routers._common import _config_profile_scope
 
             with _config_profile_scope(None):
-                return agent.chat(content, stream_callback=_wrapped_stream)
+                try:
+                    history = session_db.get_messages_as_conversation(agent.session_id)
+                except Exception as exc:
+                    raise RuntimeError("MoonPie session history is unavailable") from exc
+                result = agent.run_conversation(
+                    content,
+                    conversation_history=history,
+                    task_id=agent.session_id,
+                    stream_callback=_wrapped_stream,
+                )
+                return str(result.get("final_response") or "")
 
         try:
             result = await asyncio.to_thread(_run)
@@ -221,25 +244,46 @@ class MoonPieHermesAdapter:
     # Private — Hermes-specific internals
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _session_id(device_id: str, conversation_id: str) -> str:
+        """Stable, device-scoped Hermes session ID for a MoonPie conversation."""
+        digest = hashlib.sha256(
+            f"{device_id}\0{conversation_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"moonpie_{digest}"
+
+    def _get_session_db(self) -> Any:
+        if self._session_db_provider is None:
+            raise RuntimeError("MoonPie session database is not configured")
+        return self._session_db_provider()
+
     async def _get_agent(
-        self, tool_event_callback: Callable[[str, dict], None] | None = None,
-        *, device_id: str = "",
+        self,
+        session_id: str,
+        session_db: Any,
+        *,
+        session_key: str,
+        device_id: str,
+        conversation_id: str,
+        tool_event_callback: Callable[[str, dict], None] | None = None,
     ) -> Optional[Any]:
-        """Lazily initialise a shared ``AIAgent`` for MoonPie clients."""
-        if self._agent is not None:
+        """Lazily initialise the Hermes agent bound to one MoonPie conversation."""
+        agent = self._agents.get(session_id)
+        if agent is not None:
             # If a tool_event_callback was provided but the agent already exists,
             # wire it dynamically for this turn only.
             if tool_event_callback is not None:
-                self._wire_tool_callbacks(self._agent, tool_event_callback,
+                self._wire_tool_callbacks(agent, tool_event_callback,
                                           device_id=device_id)
-            return self._agent
+            return agent
 
         async with self._lock:
-            if self._agent is not None:
+            agent = self._agents.get(session_id)
+            if agent is not None:
                 if tool_event_callback is not None:
-                    self._wire_tool_callbacks(self._agent, tool_event_callback,
+                    self._wire_tool_callbacks(agent, tool_event_callback,
                                               device_id=device_id)
-                return self._agent
+                return agent
 
             try:
                 from run_agent import AIAgent
@@ -260,16 +304,20 @@ class MoonPieHermesAdapter:
                             if isinstance(model_cfg, dict)
                             else "kimi-k2.6"
                         )
-                        fb = cfg.get("fallback_providers", {})
+                        fb = cfg.get("fallback_providers", [])
                         fallback_model = None
-                        if isinstance(fb, dict) and fb:
+                        if isinstance(fb, list) and fb:
+                            first = fb[0]
+                        elif isinstance(fb, dict) and fb:
                             first = next(iter(fb.values()))
-                            if (
-                                isinstance(first, dict)
-                                and first.get("provider")
-                                and first.get("model")
-                            ):
-                                fallback_model = dict(first)
+                        else:
+                            first = None
+                        if (
+                            isinstance(first, dict)
+                            and first.get("provider")
+                            and first.get("model")
+                        ):
+                            fallback_model = dict(first)
                         _log.info(
                             "MoonPie agent creating with provider=%s model=%s fallback=%s",
                             provider,
@@ -282,22 +330,32 @@ class MoonPieHermesAdapter:
                             provider=provider,
                             model=model,
                             fallback_model=fallback_model,
+                            session_id=session_id,
+                            session_db=session_db,
+                            gateway_session_key=session_key,
+                            user_id=device_id,
+                            chat_id=conversation_id,
+                            chat_type="dm",
+                            load_soul_identity=True,
                         )
 
-                self._agent = await asyncio.to_thread(_init)
+                agent = await asyncio.to_thread(_init)
+                self._agents[session_id] = agent
                 if tool_event_callback is not None:
-                    self._wire_tool_callbacks(self._agent, tool_event_callback,
+                    self._wire_tool_callbacks(agent, tool_event_callback,
                                               device_id=device_id)
                 _log.info(
-                    "MoonPie agent initialized: provider=%s model=%s",
-                    getattr(self._agent, "provider", "?"),
-                    getattr(self._agent, "model", "?"),
+                    "MoonPie agent initialized: session=%s provider=%s model=%s",
+                    session_id,
+                    getattr(agent, "provider", "?"),
+                    getattr(agent, "model", "?"),
                 )
             except Exception as exc:
                 _log.warning("MoonPie agent init failed: %s", exc, exc_info=True)
-                self._agent = None
+                self._agents.pop(session_id, None)
+                agent = None
 
-        return self._agent
+        return agent
 
     def _wire_tool_callbacks(
         self,
