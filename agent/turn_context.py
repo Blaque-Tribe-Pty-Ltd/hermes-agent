@@ -1284,6 +1284,10 @@ def build_api_messages(
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
+    from agent.chat_completion_helpers import apply_fallback_continuity_prompt
+    effective_system = apply_fallback_continuity_prompt(
+        agent, api_messages, effective_system
+    )
     return api_messages, effective_system
 
 

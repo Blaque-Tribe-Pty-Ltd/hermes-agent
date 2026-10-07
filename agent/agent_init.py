@@ -1080,6 +1080,24 @@ def _init_fallback_chain(agent, fallback_model):
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
+    agent._fallback_continuity_prompt = ""
+    active_model = str(getattr(agent, "model", "") or "").strip()
+    active_provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    model_matches = [
+        entry for entry in agent._fallback_chain
+        if str(entry.get("model") or "").strip() == active_model
+    ]
+    active_entry = next(
+        (
+            entry for entry in model_matches
+            if str(entry.get("provider") or "").strip().lower() == active_provider
+        ),
+        model_matches[0] if len(model_matches) == 1 else None,
+    )
+    if active_entry is not None:
+        agent._fallback_continuity_prompt = str(
+            active_entry.get("continuity_prompt") or ""
+        ).strip()
     chain = agent._fallback_chain
     if chain and not agent.quiet_mode:
         labels = [f"{f['model']} ({f['provider']})" for f in chain]

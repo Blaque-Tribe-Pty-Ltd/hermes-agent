@@ -1772,6 +1772,46 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
+def apply_fallback_continuity_prompt(
+    agent, api_messages: List[Dict[str, Any]], effective_system: str,
+) -> str:
+    """Apply a route-scoped continuity capsule to the request copy only.
+
+    Very small local fallbacks can lose the active assistant identity inside a large
+    system prompt. A fallback entry may therefore provide ``continuity_prompt``.
+    The durable prompt and transcript remain untouched; the selected fallback sees
+    the capsule as its system prompt and immediately before the current user turn.
+    Tool schemas are assembled independently and remain attached.
+    """
+    prompt = str(getattr(agent, "_fallback_continuity_prompt", "") or "").strip()
+    if not prompt:
+        return effective_system
+
+    if api_messages and api_messages[0].get("role") == "system":
+        api_messages[0]["content"] = prompt
+    else:
+        api_messages.insert(0, {"role": "system", "content": prompt})
+
+    for message in reversed(api_messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            if not content.startswith(prompt):
+                message["content"] = f"{prompt}\n\n{content}".strip()
+        elif isinstance(content, list):
+            first = content[0] if content else None
+            already_prefixed = (
+                isinstance(first, dict)
+                and first.get("type") == "text"
+                and str(first.get("text") or "").startswith(prompt)
+            )
+            if not already_prefixed:
+                message["content"] = [{"type": "text", "text": prompt}, *content]
+        break
+    return prompt
+
+
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     return (str(fb.get("provider") or "").strip().lower(), str(fb.get("model") or "").strip(),
             str(fb.get("base_url") or "").strip().rstrip("/"))
@@ -2141,6 +2181,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             if hasattr(agent, "_transport_cache"):
                 agent._transport_cache.clear()
             agent._fallback_activated = True
+            agent._fallback_continuity_prompt = str(
+                fb.get("continuity_prompt") or ""
+            ).strip()
 
             _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
             if fb_provider == "moa":

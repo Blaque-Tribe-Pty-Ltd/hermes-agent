@@ -9,8 +9,13 @@ gpt-5.4-mini after a Codex usage-limit 429.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from agent.chat_completion_helpers import rewrite_prompt_model_identity
+from agent.agent_init import _init_fallback_chain
+from agent.chat_completion_helpers import (
+    apply_fallback_continuity_prompt,
+    rewrite_prompt_model_identity,
+)
 from agent.conversation_loop import (
     _redecorate_prompt_cache_for_provider,
     _sync_failover_system_message,
@@ -114,6 +119,57 @@ class TestSyncFailoverSystemMessage:
         result = _sync_failover_system_message(agent, api_messages, "active")
         assert api_messages[0]["content"] == "original"
         assert result == "active"
+
+    def test_route_continuity_capsule_changes_wire_copy_only(self):
+        agent = _agent()
+        agent._fallback_continuity_prompt = (
+            "You are MoonPie, the orchestrator. Neo handles infrastructure implementation."
+        )
+        api_messages = [
+            {"role": "system", "content": _PROMPT},
+            {"role": "user", "content": "Who handles a server deployment?"},
+        ]
+
+        effective = apply_fallback_continuity_prompt(agent, api_messages, _PROMPT)
+
+        assert effective == agent._fallback_continuity_prompt
+        assert api_messages[0]["content"] == agent._fallback_continuity_prompt
+        assert api_messages[1]["content"].startswith(agent._fallback_continuity_prompt)
+        assert api_messages[1]["content"].endswith("Who handles a server deployment?")
+        assert agent._cached_system_prompt == _PROMPT
+
+    def test_route_continuity_capsule_is_idempotent(self):
+        agent = _agent()
+        agent._fallback_continuity_prompt = "You are MoonPie."
+        api_messages = [
+            {"role": "system", "content": _PROMPT},
+            {"role": "user", "content": "Continue the same conversation."},
+        ]
+
+        apply_fallback_continuity_prompt(agent, api_messages, _PROMPT)
+        apply_fallback_continuity_prompt(agent, api_messages, _PROMPT)
+
+        assert api_messages[1]["content"].count(agent._fallback_continuity_prompt) == 1
+
+
+class TestRestoredFallbackContinuity:
+    def test_initialization_recovers_capsule_for_stored_fallback_route(self):
+        agent = SimpleNamespace(
+            model="deepseek-local",
+            provider="ambient-primary",
+            quiet_mode=True,
+            _fallback_activated=False,
+        )
+        chain = [{
+            "provider": "custom",
+            "model": "deepseek-local",
+            "continuity_prompt": "You are MoonPie. Neo handles infrastructure.",
+        }]
+
+        with patch("agent.agent_runtime_helpers.sync_credential_pool_entry_id"):
+            _init_fallback_chain(agent, chain)
+
+        assert agent._fallback_continuity_prompt == chain[0]["continuity_prompt"]
 
 
 

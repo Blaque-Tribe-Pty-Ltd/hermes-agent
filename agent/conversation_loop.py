@@ -1149,6 +1149,8 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         effective = (sp + "\n\n" + agent.ephemeral_system_prompt).strip() if agent.ephemeral_system_prompt else sp
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
+        from agent.chat_completion_helpers import apply_fallback_continuity_prompt
+        apply_fallback_continuity_prompt(agent, api_messages, effective)
     return sp
 
 
