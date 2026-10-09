@@ -10,6 +10,7 @@ provider, timestamp line).  See ``references/system-prompt-invariant.md``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -369,6 +370,16 @@ def _ambient_file_safety_profile_name() -> str:
     return _resolve_active_profile_name()
 
 
+def _profile_identity_revision(home: Optional[Path]) -> str:
+    """Content-only SOUL revision used to invalidate persisted prompt caches. Takes the
+    already-resolved agent home (never re-resolves it) so two calls in the same prompt build
+    cannot observe two different homes."""
+    try:
+        return hashlib.sha256((Path(home or get_hermes_home()) / "SOUL.md").read_bytes()).hexdigest()[:16]
+    except (OSError, TypeError, ValueError):
+        return "missing"
+
+
 def _active_profile_line(agent: Any) -> str:
     """Name the running profile so the agent doesn't conflate ``~/.hermes/skills``
     (default) with ``~/.hermes/profiles/<active>/skills``.  Resolved from the
@@ -376,6 +387,7 @@ def _active_profile_line(agent: Any) -> str:
     otherwise print "default" for a bot profile)."""
     _agent_home_path = _agent_home(agent)
     active_profile = _active_profile_name(agent, _ambient_file_safety_profile_name)
+    identity_revision = _profile_identity_revision(_agent_home_path)
     if active_profile == "default":
         # With an explicit agent home, the default profile's data lives at the
         # ROOT (get_hermes_home() on a bound profile session is the PROFILE dir).
@@ -387,7 +399,7 @@ def _active_profile_line(agent: Any) -> str:
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
+            "you to.\nProfile identity revision: " + identity_revision + "."
         )
     # A non-default name is only returned when the resolved home is ALREADY
     # <root>/profiles/<name>, so the profile home is the session home itself.
@@ -405,7 +417,7 @@ def _active_profile_line(agent: Any) -> str:
         f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
         f"different session run from a different shell. Do NOT modify "
         f"another profile's skills/plugins/cron/memories unless the user "
-        f"explicitly directs you to."
+        f"explicitly directs you to.\nProfile identity revision: {identity_revision}."
     )
 
 

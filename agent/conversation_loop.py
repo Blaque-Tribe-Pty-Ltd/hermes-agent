@@ -855,6 +855,21 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+    # Only a mismatch when BOTH sides are known (mirrors the Model/Provider guard below):
+    # a stored prompt that predates this trailer has no line to compare, and a transient
+    # SOUL.md read failure must not invalidate every cached prompt on the host. Skip computing
+    # the current revision entirely when there is nothing stored to compare it against —
+    # _profile_identity_revision() touches the filesystem and must not run on every turn of
+    # every legacy prompt that has no such line yet.
+    stored_revision = identity_line_value(prompt, "Profile identity revision").rstrip(".")  # the embedded line is prose ending in a period; the raw hash never has one
+    if stored_revision:
+        try:
+            from agent.system_prompt import _agent_home, _profile_identity_revision
+            current_revision = _profile_identity_revision(_agent_home(agent))
+        except Exception:
+            current_revision = "missing"
+        if current_revision != "missing" and stored_revision != current_revision:
+            return False
     # Model/provider identity, then cwd drift.  A cwd change is a real content change (context
     # files, the workspace snapshot and the coding posture are all resolved from it), so it
     # still rebuilds; the runtime surface does not (agent/surface_switch.py).

@@ -461,6 +461,7 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
         "plugins/, cron/, and memories/ that affect a different session than "
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
+        "\nProfile identity revision: missing."
     )
     expected = "\n\n".join((
         "IDENTITY",

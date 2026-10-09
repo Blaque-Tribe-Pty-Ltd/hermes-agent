@@ -1777,39 +1777,22 @@ def apply_fallback_continuity_prompt(
 ) -> str:
     """Apply a route-scoped continuity capsule to the request copy only.
 
-    Very small local fallbacks can lose the active assistant identity inside a large
-    system prompt. A fallback entry may therefore provide ``continuity_prompt``.
-    The durable prompt and transcript remain untouched; the selected fallback sees
-    the capsule as its system prompt and immediately before the current user turn.
+    Very small local fallbacks can lose useful continuity inside a large system
+    prompt. A fallback entry may therefore provide ``continuity_prompt``. The
+    capsule is additive and non-authoritative: the active profile identity stays
+    in the system prompt and the user message is not rewritten.
     Tool schemas are assembled independently and remain attached.
     """
     prompt = str(getattr(agent, "_fallback_continuity_prompt", "") or "").strip()
     if not prompt:
         return effective_system
 
+    combined = f"{effective_system}\n\n## Provider fallback continuity\n{prompt}".strip()
     if api_messages and api_messages[0].get("role") == "system":
-        api_messages[0]["content"] = prompt
+        api_messages[0]["content"] = combined
     else:
-        api_messages.insert(0, {"role": "system", "content": prompt})
-
-    for message in reversed(api_messages):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content", "")
-        if isinstance(content, str):
-            if not content.startswith(prompt):
-                message["content"] = f"{prompt}\n\n{content}".strip()
-        elif isinstance(content, list):
-            first = content[0] if content else None
-            already_prefixed = (
-                isinstance(first, dict)
-                and first.get("type") == "text"
-                and str(first.get("text") or "").startswith(prompt)
-            )
-            if not already_prefixed:
-                message["content"] = [{"type": "text", "text": prompt}, *content]
-        break
-    return prompt
+        api_messages.insert(0, {"role": "system", "content": combined})
+    return combined
 
 
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
