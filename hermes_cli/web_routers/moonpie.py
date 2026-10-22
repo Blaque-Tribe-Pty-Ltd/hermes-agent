@@ -24,6 +24,10 @@ from hermes_cli.moonpie_media import build_moonpie_message_content
 from hermes_state import SessionDB
 
 _log = logging.getLogger("hermes_cli.web_server")
+from hermes_cli.moonpie_jobs import TurnJobRegistry
+
+_turn_jobs = TurnJobRegistry()
+
 router = APIRouter(prefix="/api/moonpie")
 
 _PAIRING_TTL_SECONDS = 300
@@ -410,8 +414,19 @@ async def list_jobs(
 async def get_job(job_id: str, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.debug("get_job %s for %s", job_id, device_id)
-    # TODO: Query job state
-    raise HTTPException(status_code=404, detail="Job not found")
+    row = _get_moonpie_db().get_moonpie_job(job_id, device_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobDetail(
+        id=row["id"],
+        title=row["title"],
+        status=row["status"],
+        progress=row["progress"],
+        message=row["message"],
+        created_at=_ts_to_iso(row["created_at"]),
+        completed_at=_ts_to_iso(row["completed_at"]) if row["completed_at"] else None,
+        error=row.get("error"),
+    )
 
 
 @router.get("/jobs/{job_id}/diff")
@@ -710,10 +725,27 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                 )
 
             session_tokens = []
+            tracker = _turn_jobs.start(
+                _get_moonpie_db(), conn.device_id or "", conversation_id,
+                payload.get("text", params.get("content", "")),
+            )
+
+            async def send_job_notes(notes: list) -> None:
+                # Same queue as the tool events (scheduled from the agent thread), so a closing note cannot overtake an earlier one.
+                for note in notes:
+                    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(conn.send_json(note), loop))
+
             try:
                 # Gate 5: Tool visibility — wire tool lifecycle events to the client.
                 def tool_event_callback(event_type: str, event_data: dict) -> None:
                     """Sync callback from the agent thread; bridge to async WebSocket."""
+                    try:
+                        job_notes = tracker.on_tool_event(event_type, event_data)
+                    except Exception:
+                        _log.warning("MoonPie job tracking failed", exc_info=True)
+                        job_notes = []
+                    for note in job_notes:
+                        asyncio.run_coroutine_threadsafe(conn.send_json(note), loop)
                     asyncio.run_coroutine_threadsafe(
                         conn.send_json({
                             "jsonrpc": "2.0",
@@ -744,6 +776,7 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     reasoning_level=params.get("reasoning_level"),
                     permission_mode=params.get("permission_mode"),
                 )
+                await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "done"))
 
                 # If the model didn't stream deltas, send one full delta now so the
                 # client has content to render before the complete notification.
@@ -790,6 +823,7 @@ async def _moonpie_loop(conn: _MoonPieConnection):
 
             except RuntimeError as exc:
                 _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
+                await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The agent was not available"))
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "id": req_id,
@@ -797,17 +831,24 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                 })
             except Exception as exc:
                 _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
+                await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The turn failed"))
                 await conn.send_json({
                     "jsonrpc": "2.0",
                     "id": req_id,
                     "error": {"code": -32000, "message": str(exc)},
                 })
             finally:
+                try:  # a turn ended some other way (e.g. the socket closed) must not leave its job running
+                    await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The connection closed"))
+                except Exception:
+                    _log.debug("MoonPie could not report a closed job", exc_info=True)
+                _turn_jobs.end(conn.device_id or "", conversation_id, tracker)
                 if session_tokens:
                     clear_session_vars(session_tokens)
 
         elif method == "conversation.cancel":
             conversation_id = params.get("conversation_id", "")
+            _turn_jobs.mark_cancelled(conn.device_id or "", conversation_id)
             cancel_result = _moonpie_adapter.cancel_turn(
                 conn.device_id or "", conversation_id
             )
