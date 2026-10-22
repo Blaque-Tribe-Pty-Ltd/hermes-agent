@@ -35,6 +35,14 @@ def _is_mcp_toolset_name(name: str) -> bool:
         target = None
     return bool(target and str(target).startswith("mcp-"))
 
+def _registered_mcp_toolsets() -> set:
+    """Canonical MCP toolsets registered in the current scope (empty when the registry cannot be read)."""
+    try:
+        from tools.registry import registry
+        return {name for name in registry.get_registered_toolset_names() if _is_mcp_toolset_name(name)}
+    except Exception:
+        return set()
+
 def _expand_parent_toolsets(parent_toolsets: set) -> set:
     """Add every toolset whose tools are a subset of the parent's tools: a parent on a composite like ``hermes-cli``
     must still let a child request ``web``/``terminal``; bare name intersection would reject them. Both sides use
@@ -92,6 +100,12 @@ def _resolve_child_toolsets(
         parent_toolsets = {
             ts for name in parent_agent.valid_tool_names if (ts := model_tools.get_toolset_for_tool(name)) is not None
         }
+        # ``enabled_toolsets=None`` is "all tools", including the MCP tools the parent reaches through ``tool_search``.
+        # Those are deferred, so they are not in ``valid_tool_names`` and the derivation above never sees their toolset:
+        # the child would be built without any MCP tools (a delegated task could not use a Mac workspace server its
+        # parent could). With ``inherit_mcp_toolsets`` on, the child gets the MCP toolsets registered in this scope.
+        if _get_inherit_mcp_toolsets():
+            parent_toolsets |= _registered_mcp_toolsets()
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
