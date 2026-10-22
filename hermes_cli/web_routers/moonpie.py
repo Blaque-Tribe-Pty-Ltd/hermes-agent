@@ -617,6 +617,11 @@ def _fetch_delegations(session_ids: List[str], since: float) -> List[Dict[str, A
     return _get_moonpie_db().list_completed_delegations(session_ids, since)
 
 
+def _fetch_request(session_id: str, dispatched_at: float) -> Optional[str]:
+    """What the user asked for when the work was dispatched (a named function so tests can replace just this)."""
+    return _get_moonpie_db().last_user_request(session_id, dispatched_at)
+
+
 def _spawn_turn(conn: "_MoonPieConnection", turn) -> None:
     """Run *turn* (a coroutine) as a task, after any earlier turn of this connection has finished.
 
@@ -884,6 +889,7 @@ async def _moonpie_loop(conn: _MoonPieConnection):
             # connection.ready: the app ignores traffic that arrives before it.
             conn.delegation_task = asyncio.ensure_future(DelegationWatcher(
                 fetch=_fetch_delegations,
+                request_for=_fetch_request,
                 sessions=lambda: _moonpie_adapter.conversations_for_device(device_id),
                 send=conn.send_json,
             ).run())

@@ -189,3 +189,78 @@ def test_the_adapter_remembers_which_conversation_a_session_belongs_to():
     adapter._conversations[sid] = ("dev", "conv-1")
     adapter._conversations[adapter._session_id("other", "conv-9")] = ("other", "conv-9")
     assert adapter.conversations_for_device("dev") == {sid: "conv-1"}
+
+
+# --- the user's own request as the headline ---------------------------------------------------------------------
+
+from hermes_cli.moonpie_delegation_push import request_headline
+
+
+def test_the_headline_is_the_users_request_without_the_apps_project_block():
+    stored = ("Delegate this to Neo: add Sources/Farewell.swift.\n\n"
+              "<moonpie_project name=\"p\" branch=\"main\">\nThe user is working in the project.\n</moonpie_project>")
+    assert request_headline(stored) == "Delegate this to Neo: add Sources/Farewell.swift."
+    assert request_headline("  one\n two  ") == "one two"
+    assert request_headline(None) == ""
+    assert len(request_headline("word " * 100)) <= 140
+
+
+def test_the_message_uses_the_users_request_and_falls_back_to_the_delegated_prompt():
+    event = _event()
+    with_request = build_completion(event, "Add a greeter to the project")
+    assert with_request["text"].startswith("A delegated task finished: Add a greeter to the project\n")
+    assert "Act as Neo" not in with_request["text"]
+    fallback = build_completion(event, None)
+    assert fallback["text"].startswith("A delegated task finished: Act as Neo.")
+    assert build_completion(event, "   ")["text"].startswith("A delegated task finished: Act as Neo.")
+
+
+@pytest.mark.asyncio
+async def test_the_watcher_looks_up_the_request_that_was_made_before_dispatch():
+    sent, asked = [], {}
+
+    async def send(data):
+        sent.append(data)
+
+    def request_for(session_id, before):
+        asked["args"] = (session_id, before)
+        return "Please add the Greeter"
+
+    event = _event(dispatched_at=1000.0)
+    watcher = DelegationWatcher(lambda ids, since: [_row(event=event)], lambda: {"moonpie_abc": "c1"}, send, request_for=request_for)
+    await watcher.poll_once()
+    assert asked["args"] == ("moonpie_abc", 1000.0)
+    assert "Please add the Greeter" in sent[0]["params"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_request_lookup_still_delivers_with_the_fallback_goal():
+    sent = []
+
+    async def send(data):
+        sent.append(data)
+
+    def boom(session_id, before):
+        raise RuntimeError("db locked")
+
+    watcher = DelegationWatcher(lambda ids, since: [_row()], lambda: {"moonpie_abc": "c1"}, send, request_for=boom)
+    assert await watcher.poll_once() == 1
+    assert sent[0]["params"]["text"].startswith("A delegated task finished: Act as Neo.")
+
+
+def test_the_database_returns_the_last_real_user_message_before_the_time(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("moonpie_abc", source="api_server")
+        db.append_message("moonpie_abc", "user", "first request", timestamp=100.0)
+        db.append_message("moonpie_abc", "assistant", "ok", timestamp=101.0)
+        db.append_message("moonpie_abc", "user", "second request\n\n<moonpie_project name=\"p\">x</moonpie_project>", timestamp=200.0)
+        db.append_message("moonpie_abc", "user", "[ASYNC DELEGATION BATCH COMPLETE]", timestamp=250.0,
+                          display_kind="async_delegation_complete")
+        db.append_message("moonpie_abc", "user", "a later request", timestamp=300.0)
+        assert db.last_user_request("moonpie_abc", 260.0).startswith("second request")
+        assert db.last_user_request("moonpie_abc", 150.0) == "first request"
+        assert db.last_user_request("moonpie_abc", 50.0) is None
+        assert db.last_user_request("moonpie_zzz", 999.0) is None
+    finally:
+        db.close()

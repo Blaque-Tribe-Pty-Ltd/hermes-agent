@@ -210,6 +210,16 @@ class SessionMoonpieMixin:
             })
         return out
 
+    def last_user_request(self, session_id: str, before: float) -> Optional[str]:
+        """The newest real user message of *session_id* sent at or before *before* (delivery rows are not requests)."""
+        rows = self._read_all(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+            "AND coalesce(display_kind, '') NOT IN ('async_delegation_complete', 'hidden') AND timestamp <= ? "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (session_id, before),
+        )
+        return rows[0]["content"] if rows else None
+
     def create_moonpie_job(
         self, device_id: str, title: str = "", status: str = "pending",
     ) -> str:

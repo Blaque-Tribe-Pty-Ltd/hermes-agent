@@ -43,12 +43,26 @@ def _summarise(summary: Any) -> str:
     return _clip(raw, _TEXT_LIMIT)
 
 
-def build_completion(event: Dict[str, Any]) -> Dict[str, Any]:
-    """The message the app shows for a finished delegation event (the ``event_json`` of an ``async_delegations`` row)."""
+_PROJECT_BLOCK = "<moonpie_project"
+
+
+def request_headline(content: Any) -> str:
+    """The user's own words from a stored message: the app appends a project block after a blank line, which is not theirs."""
+    text = str(content or "").split(_PROJECT_BLOCK)[0]
+    first_paragraph = text.strip().split("\n\n")[0]
+    return _clip(first_paragraph, _GOAL_LIMIT)
+
+
+def build_completion(event: Dict[str, Any], request: Optional[str] = None) -> Dict[str, Any]:
+    """The message the app shows for a finished delegation event (the ``event_json`` of an ``async_delegations`` row).
+
+    *request* is what the user asked for; the delegated prompt (``event["goal"]``) is the fallback because it is written for
+    the child, not for the user."""
     results = [r for r in (event.get("results") or []) if isinstance(r, dict)]
     failed = str(event.get("status") or "").lower() in _FAILED or any(
         str(r.get("status") or "").lower() in _FAILED for r in results)
-    goal = _clip(str(event.get("goal") or ""), _GOAL_LIMIT)
+    goal = request_headline(request) if request else ""
+    goal = goal or _clip(str(event.get("goal") or ""), _GOAL_LIMIT)
     lines: List[str] = []
     for index, result in enumerate(results):
         body = _summarise(result.get("summary")) or (_clip(result.get("error"), _TEXT_LIMIT) if result.get("error") else "")
@@ -85,9 +99,11 @@ class DelegationWatcher:
         sessions: Callable[[], Dict[str, str]],
         send: Callable[[Dict[str, Any]], Awaitable[None]],
         *,
+        request_for: Optional[Callable[[str, float], Optional[str]]] = None,
         interval: float = 3.0,
         started_at: Optional[float] = None,
     ) -> None:
+        self._request_for = request_for
         self._fetch = fetch
         self._sessions = sessions
         self._send = send
@@ -114,7 +130,14 @@ class DelegationWatcher:
             if not isinstance(event, dict):
                 continue
             self._pushed.add(delegation_id)
-            completion = build_completion({**event, "delegation_id": delegation_id})
+            request = None
+            if self._request_for is not None:
+                try:
+                    dispatched = event.get("dispatched_at") or row.get("completed_at") or time.time()
+                    request = await asyncio.to_thread(self._request_for, str(row.get("parent_session_id") or ""), float(dispatched))
+                except Exception:
+                    _log.debug("delegation request lookup failed", exc_info=True)
+            completion = build_completion({**event, "delegation_id": delegation_id}, request)
             await self._send({
                 "jsonrpc": "2.0",
                 "method": "delegation.completed",
