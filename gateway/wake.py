@@ -139,6 +139,23 @@ def _delegation_display_metadata(evt: dict) -> dict:
     return metadata
 
 
+def _delivery_target_session(db: Any, session_id: str, evt: dict) -> str:
+    """*session_id* if it is a real session, else the event's parent/origin session when that one exists, else
+    *session_id* unchanged (the write then fails as before so the caller releases the claim and retries)."""
+    getter = getattr(db, "get_session", None)
+    if not callable(getter):
+        return session_id
+    try:
+        if getter(session_id):
+            return session_id
+        for candidate in (evt.get("parent_session_id"), evt.get("origin_session_id")):
+            if candidate and candidate != session_id and getter(str(candidate)):
+                return str(candidate)
+    except Exception:
+        logger.debug("delegation delivery target lookup failed for %s", session_id, exc_info=True)
+    return session_id
+
+
 async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: str, evt: Optional[dict] = None) -> None:
     """Persist an async-delegation completion as a durable DELIVERY row (see module docstring)
     WITHOUT running any agent turn. Raises on failure so the caller can release the durable claim
@@ -174,6 +191,11 @@ async def persist_delegation_delivery(adapter: Any, *, text: str, session_id: st
                 session_id = str(resolved)
         except Exception:
             logger.debug("delegation delivery continuation resolve failed for %s", session_id, exc_info=True)
+    # MoonPie's gateway session key (``moonpie_<device>``) is a routing key, not a session row: its conversations
+    # are per-conversation ``moonpie_<hash>`` sessions. Appending under the key hit "FOREIGN KEY constraint failed" and
+    # the watcher retried it forever. When the routed session does not exist, deliver to the parent session the event
+    # names (the conversation that dispatched the work), which the next turn reads.
+    session_id = await asyncio.to_thread(_delivery_target_session, db, session_id, evt or {})
     await asyncio.to_thread(
         db.append_delegation_delivery, session_id, text, _delegation_display_metadata(evt or {}),
     )
