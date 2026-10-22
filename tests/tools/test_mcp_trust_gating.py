@@ -155,6 +155,38 @@ class TestTrustGateAtCallTime:
         consent.assert_not_called()
         assert json.loads(raw) == {"result": "ok"}
 
+    def test_scope_mismatch_fails_closed_when_another_scope_marks_it_untrusted(self, fake_session):
+        """A thread that lost its scope looks up the bare name, finds no record, and must not read that as trusted
+        while a scoped record says untrusted (the multiplexed dashboard case)."""
+        mcp_tool._server_trust_levels[("profile-a", "srv")] = "untrusted"
+        handler = _mcp_handlers._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch(
+            "tools.approval_prompt.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            raw = handler({"repo": "x"})
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "error" in json.loads(raw)
+
+    def test_scope_with_its_own_full_record_keeps_its_policy(self, fake_session):
+        """The fallback never overrides a scope's own record: only a missing record is read as the stricter tier."""
+        mcp_tool._server_trust_levels["srv"] = "full"
+        mcp_tool._server_trust_levels[("profile-a", "srv")] = "untrusted"
+        handler = _mcp_handlers._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch("tools.approval_prompt.request_elicitation_consent") as consent:
+            raw = handler({"repo": "x"})
+        consent.assert_not_called()
+        assert json.loads(raw) == {"result": "ok"}
+
+    def test_scope_mismatch_with_only_full_records_stays_trusted(self, fake_session):
+        mcp_tool._server_trust_levels[("profile-a", "srv")] = "full"
+        handler = _mcp_handlers._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch("tools.approval_prompt.request_elicitation_consent") as consent:
+            raw = handler({"repo": "x"})
+        consent.assert_not_called()
+        assert json.loads(raw) == {"result": "ok"}
+
     def test_read_only_false_hint_is_gated(self, fake_session):
         """An explicit readOnlyHint=False is write-capable."""
         _set_trust("srv", "untrusted")

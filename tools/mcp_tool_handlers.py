@@ -59,9 +59,15 @@ def _tool_is_read_only(server_name: str, tool_name: str) -> bool:
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
     else a ``tool_error``. Fail-closed: approval-system errors block."""
-    from tools.mcp_tool_scope import _server_key
+    from tools.mcp_tool_scope import _key_name, _server_key
     # Trust is the calling profile's own policy (an adopter of a shared connection keeps its own tier).
-    trust = _core._server_trust_levels.get(_server_key(server_name), _core._TRUST_FULL)
+    trust = _core._server_trust_levels.get(_server_key(server_name))
+    if trust is None:
+        # No record for the calling scope. A server nobody configured stays trusted (backward compatible), but when any
+        # other scope marks it untrusted, a thread that lost its scope must not read that gap as "trusted": it takes the
+        # stricter tier. This only ever tightens; a scope with its own record keeps its own policy.
+        levels = [v for k, v in _core._server_trust_levels.items() if _key_name(k) == server_name]
+        trust = _core._TRUST_UNTRUSTED if _core._TRUST_UNTRUSTED in levels else _core._TRUST_FULL
     if trust != _core._TRUST_UNTRUSTED or _tool_is_read_only(server_name, tool_name):
         return None
     try:  # lazy: tools.approval routes the prompt to whichever surface owns the session
