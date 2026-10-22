@@ -138,6 +138,15 @@ class SessionMoonpieMixin:
             "archived": bool(row["archived"]),
         }
 
+    @staticmethod
+    def _without_context_note(text: str) -> str:
+        """Drop the app's leading "[Context: ...]" block (sent in front of a message after the user interrupted Chawah); it is for the agent, not the history."""
+        if text.startswith("[Context:"):
+            end = text.find("]\n\n")
+            if end != -1:
+                return text[end + 3:].lstrip()
+        return text
+
     def record_moonpie_exchange(
         self, device_id: str, conversation_id: str, user_text: str, assistant_text: str,
     ) -> None:
@@ -148,6 +157,7 @@ class SessionMoonpieMixin:
         """
         if not conversation_id:
             return
+        user_text = self._without_context_note(user_text or "")
         now = time.time()
         pairs = [(role, text) for role, text in (("user", user_text), ("assistant", assistant_text)) if text and text.strip()]
         if not pairs:

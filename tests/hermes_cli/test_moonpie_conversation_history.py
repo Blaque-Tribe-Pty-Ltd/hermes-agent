@@ -70,3 +70,18 @@ def test_list_shows_the_conversation_after_an_exchange(client, valid_token, devi
     response = client.get("/api/moonpie/conversations", headers=_auth(valid_token))
     assert response.status_code == 200
     assert [c["id"] for c in response.json()] == ["conv-5"]
+
+
+def test_the_apps_context_note_is_not_stored_or_used_as_the_title(device_token_store):
+    db = device_token_store
+    note = '[Context: the user interrupted you before you finished answering their previous message: "What is on today?". Carry on.]\n\n'
+    db.record_moonpie_exchange("dev", "conv-3", note + "No, the other calendar", "Understood")
+    [row] = db.list_moonpie_conversations("dev")
+    assert row["title"] == "No, the other calendar"
+    assert [m["content"] for m in db.list_moonpie_messages("conv-3", "dev")] == ["No, the other calendar", "Understood"]
+
+
+def test_text_that_only_looks_like_a_note_is_kept(device_token_store):
+    db = device_token_store
+    db.record_moonpie_exchange("dev", "conv-4", "[Context: not terminated", "ok")
+    assert db.list_moonpie_messages("conv-4", "dev")[0]["content"] == "[Context: not terminated"
