@@ -24,6 +24,7 @@ from hermes_cli.moonpie_media import build_moonpie_message_content
 from hermes_state import SessionDB
 
 _log = logging.getLogger("hermes_cli.web_server")
+from hermes_cli.moonpie_delegation_push import DelegationWatcher
 from hermes_cli.moonpie_jobs import TurnJobRegistry
 
 _turn_jobs = TurnJobRegistry()
@@ -502,6 +503,7 @@ class _MoonPieConnection:
         # The loop that owns this socket. Approval notifications are raised from the agent's worker thread, which has
         # no event loop of its own, so asking for "the current loop" there fails (Python 3.12+) and every approval fails closed.
         self.turn_tasks: set = set()
+        self.delegation_task: Optional[asyncio.Task] = None
         self.turn_tail: Optional[asyncio.Task] = None
         try:
             self._loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
@@ -597,6 +599,8 @@ async def moonpie_websocket(websocket: WebSocket):
     finally:
         for task in list(conn.turn_tasks):
             task.cancel()
+        if conn.delegation_task is not None:
+            conn.delegation_task.cancel()
         if conn.device_id:
             _moonpie_connections.pop(conn.device_id, None)
             # Unregister from the gateway approval system so pending approvals
@@ -606,6 +610,11 @@ async def moonpie_websocket(websocket: WebSocket):
                 unregister_gateway_notify(conn.session_key)
             except Exception:
                 _log.debug("unregister_gateway_notify failed for %s", conn.device_id, exc_info=True)
+
+
+def _fetch_delegations(session_ids: List[str], since: float) -> List[Dict[str, Any]]:
+    """Completed delegations of the given conversation sessions (a named function so tests can replace just this)."""
+    return _get_moonpie_db().list_completed_delegations(session_ids, since)
 
 
 def _spawn_turn(conn: "_MoonPieConnection", turn) -> None:
@@ -870,6 +879,14 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                 "method": "connection.ready",
                 "params": {"device_id": device_id},
             })
+
+            # Tell the app when a delegated task of this device's conversations finishes. Started only after
+            # connection.ready: the app ignores traffic that arrives before it.
+            conn.delegation_task = asyncio.ensure_future(DelegationWatcher(
+                fetch=_fetch_delegations,
+                sessions=lambda: _moonpie_adapter.conversations_for_device(device_id),
+                send=conn.send_json,
+            ).run())
             continue
 
         # -- Unauthenticated gate ---------------------------------------------

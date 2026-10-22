@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import json
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -182,6 +183,32 @@ class SessionMoonpieMixin:
             }
             for row in rows
         ]
+
+    def list_completed_delegations(self, parent_session_ids: List[str], since: float) -> List[Dict[str, Any]]:
+        """Completed async delegations dispatched from any of *parent_session_ids*, finished at or after *since*."""
+        ids = [str(i) for i in parent_session_ids if i]
+        if not ids:
+            return []
+        marks = ",".join("?" * len(ids))
+        rows = self._read_all(
+            "SELECT delegation_id, parent_session_id, completed_at, event_json FROM async_delegations "
+            f"WHERE parent_session_id IN ({marks}) AND completed_at IS NOT NULL AND completed_at >= ? "
+            "ORDER BY completed_at ASC",
+            [*ids, since],
+        )
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                event = json.loads(row["event_json"]) if row["event_json"] else None
+            except (ValueError, TypeError):
+                event = None
+            out.append({
+                "delegation_id": row["delegation_id"],
+                "parent_session_id": row["parent_session_id"],
+                "completed_at": row["completed_at"],
+                "event": event if isinstance(event, dict) else None,
+            })
+        return out
 
     def create_moonpie_job(
         self, device_id: str, title: str = "", status: str = "pending",

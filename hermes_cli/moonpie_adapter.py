@@ -65,6 +65,9 @@ class MoonPieHermesAdapter:
         self._lock = asyncio.Lock()
         self._turn_lock = threading.Lock()
         self._active_turns: dict[str, _TurnState] = {}
+        # session id -> (device id, conversation id), so work that finishes later (a delegation) can be routed back to
+        # the conversation that started it. In memory only: it is rebuilt as conversations send messages.
+        self._conversations: dict[str, tuple[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Public interface (Hermes-agnostic upward-facing)
@@ -100,6 +103,7 @@ class MoonPieHermesAdapter:
         if not device_id or not conversation_id:
             raise RuntimeError("MoonPie device and conversation IDs are required")
         session_id = self._session_id(device_id, conversation_id)
+        self._conversations[session_id] = (device_id, conversation_id)
         session_db = self._get_session_db()
         agent = await self._get_agent(
             session_id,
@@ -227,6 +231,10 @@ class MoonPieHermesAdapter:
                     _log.warning("MoonPie: failed to restore a per-turn option", exc_info=True)
 
         return restore
+
+    def conversations_for_device(self, device_id: str) -> dict[str, str]:
+        """``{session id: conversation id}`` for the conversations this device has used since the server started."""
+        return {sid: conv for sid, (dev, conv) in list(self._conversations.items()) if dev == device_id}
 
     def usage_snapshot(self, device_id: str = "", conversation_id: str = "") -> dict | None:
         """Token counters after a turn, or None when the agent exposes nothing usable."""
