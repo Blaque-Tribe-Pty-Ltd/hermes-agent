@@ -48,8 +48,14 @@ def _normalize_server_trust(value: Any) -> str:
 def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     """True only when annotations (SDK object or cache dict) carry ``readOnlyHint is True``; unknown = write-capable."""
     annotations = getattr(mcp_tool, "annotations", None)
-    hint = annotations.get("readOnlyHint") if isinstance(annotations, dict) else getattr(annotations, "readOnlyHint", None)
-    return hint is True
+    # The wire/JSON name is ``readOnlyHint``; newer MCP SDK ``ToolAnnotations`` objects expose it as ``read_only_hint``
+    # (a lookup of only the camelCase name found nothing, so every tool on an untrusted server was gated, even listing a
+    # directory). Either spelling counts, and only an exact ``True`` does: anything else stays write-capable.
+    for name in ("readOnlyHint", "read_only_hint"):
+        hint = annotations.get(name) if isinstance(annotations, dict) else getattr(annotations, name, None)
+        if hint is True:
+            return True
+    return False
 
 
 def _record_tool_trust_metadata(server_name: str, config: dict, tools: List[Any], key=None) -> None:

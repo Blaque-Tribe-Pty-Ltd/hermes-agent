@@ -350,6 +350,24 @@ class TestAnnotationCaptureAtDiscovery:
         assert not hints.get("delete_repo")
         assert not hints.get("no_annotations")
 
+    def test_snake_case_sdk_annotation_counts_as_read_only(self):
+        """Newer SDK ToolAnnotations objects expose read_only_hint; only camelCase was read before (every tool was gated)."""
+        snake = SimpleNamespace(annotations=SimpleNamespace(read_only_hint=True, destructive_hint=False))
+        assert _mcp_registration._annotation_read_only_hint(snake) is True
+
+    def test_snake_case_false_none_and_truthy_non_bool_stay_write_capable(self):
+        for value in (False, None, "true", 1):
+            tool = SimpleNamespace(annotations=SimpleNamespace(read_only_hint=value))
+            assert _mcp_registration._annotation_read_only_hint(tool) is False
+
+    def test_snake_case_dict_annotations_supported(self):
+        assert _mcp_registration._annotation_read_only_hint(SimpleNamespace(annotations={"read_only_hint": True})) is True
+        assert _mcp_registration._annotation_read_only_hint(SimpleNamespace(annotations={"read_only_hint": False})) is False
+
+    def test_missing_annotations_stay_write_capable(self):
+        assert _mcp_registration._annotation_read_only_hint(SimpleNamespace(annotations=None)) is False
+        assert _mcp_registration._annotation_read_only_hint(SimpleNamespace()) is False
+
     def test_dict_annotations_supported(self):
         """Cached/JSON annotations arrive as plain dicts."""
         assert _mcp_registration._annotation_read_only_hint(
