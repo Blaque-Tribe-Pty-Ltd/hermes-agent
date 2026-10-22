@@ -378,8 +378,20 @@ async def create_conversation(authorization: str =  Header(default="")):
 async def get_conversation(conversation_id: str, authorization: str = Header(default="")):
     device_id = _authenticate_device(authorization)
     _log.debug("get_conversation %s for %s", conversation_id, device_id)
-    # TODO: Query SessionDB
-    raise HTTPException(status_code=404, detail="Conversation not found")
+    db = _get_moonpie_db()
+    row = db.get_moonpie_conversation(conversation_id, device_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return ConversationDetail(
+        id=row["id"],
+        title=row["title"],
+        messages=[
+            {"role": m["role"], "content": m["content"], "created_at": _ts_to_iso(m["created_at"])}
+            for m in db.list_moonpie_messages(conversation_id, device_id)
+        ],
+        created_at=_ts_to_iso(row["created_at"]),
+        updated_at=_ts_to_iso(row["updated_at"]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +743,14 @@ async def _handle_conversation_message(conn: "_MoonPieConnection", params: dict,
             permission_mode=params.get("permission_mode"),
         )
         await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "done"))
+        if not tracker.cancelled:
+            try:  # remember the exchange so the device can restore this conversation later; never let it break the turn
+                _get_moonpie_db().record_moonpie_exchange(
+                    conn.device_id or "", conversation_id,
+                    payload.get("text", params.get("content", "")) or "", final_response or "",
+                )
+            except Exception:
+                _log.warning("MoonPie could not store the exchange", exc_info=True)
 
         # If the model didn't stream deltas, send one full delta now so the
         # client has content to render before the complete notification.
