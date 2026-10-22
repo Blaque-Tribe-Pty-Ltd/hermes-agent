@@ -30,6 +30,9 @@ from typing import Any, Callable, Optional
 
 _log = logging.getLogger("hermes_cli.moonpie_adapter")
 
+# How long a new conversation agent waits for MCP servers to connect before its tool snapshot is taken.
+_MCP_DISCOVERY_WAIT_SECONDS = 25.0
+
 
 class _TurnState:
     """Per-device turn state for cancellation tracking (Gate 6, B5)."""
@@ -402,6 +405,15 @@ class MoonPieHermesAdapter:
 
                 def _init():
                     with _config_profile_scope(None):
+                        # A standalone dashboard only ARMS MCP discovery; the first /api/ws client or agent build fires
+                        # it. MoonPie connects through neither, so without this its agents are built with no MCP tools
+                        # after every restart. Bounded, and a failure never blocks the turn.
+                        try:
+                            from hermes_cli.mcp_startup import wait_for_mcp_discovery
+
+                            wait_for_mcp_discovery(timeout=_MCP_DISCOVERY_WAIT_SECONDS)
+                        except Exception:
+                            _log.warning("MoonPie: MCP discovery wait failed", exc_info=True)
                         cfg = load_config_readonly()
                         model_cfg = cfg.get("model", {})
                         provider = (
