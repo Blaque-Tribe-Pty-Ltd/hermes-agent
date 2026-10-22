@@ -46,3 +46,37 @@ def test_mcp_tool_consent_offers_only_once_or_deny():
 def test_missing_pattern_key_keeps_the_existing_behaviour():
     params = _notify({"request_id": "r3", "command": "ls", "description": ""})
     assert params["actions"] == ["once", "session", "always", "deny"]
+
+
+def test_approval_is_delivered_when_raised_from_a_worker_thread_without_an_event_loop():
+    """The agent raises approvals from a ThreadPoolExecutor thread. Asking that thread for 'the current loop'
+    raised, the notify failed and every approval was refused (observed live)."""
+    import threading
+
+    sent = []
+    errors = []
+
+    async def run():
+        conn = mp._MoonPieConnection(MagicMock())
+        conn.device_id = "dev"
+
+        async def record(data):
+            sent.append(data)
+
+        conn.send_json = record
+
+        def from_worker():
+            try:
+                with patch.object(mp, "_get_moonpie_db", return_value=MagicMock()):
+                    conn._approval_notify({"request_id": "w1", "command": "ls", "description": "d", "pattern_key": "x"})
+            except Exception as exc:  # the failure mode being pinned
+                errors.append(exc)
+
+        worker = threading.Thread(target=from_worker)
+        worker.start()
+        worker.join()
+        await asyncio.sleep(0.1)
+
+    asyncio.run(run())
+    assert errors == []
+    assert [m["params"]["approval_id"] for m in sent] == ["w1"]

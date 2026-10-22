@@ -499,6 +499,12 @@ class _MoonPieConnection:
         self.device_id: Optional[str] = None
         self.connected_at = time.time()
         self.authenticated_at: Optional[float] = None
+        # The loop that owns this socket. Approval notifications are raised from the agent's worker thread, which has
+        # no event loop of its own, so asking for "the current loop" there fails (Python 3.12+) and every approval fails closed.
+        try:
+            self._loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     @property
     def is_authenticated(self) -> bool:
@@ -540,7 +546,7 @@ class _MoonPieConnection:
         # "session" or "always" would promise something that does not happen.
         actions = ["once", "deny"] if approval_data.get("pattern_key") == "mcp_elicitation" else ["once", "session", "always", "deny"]
 
-        loop = asyncio.get_event_loop()
+        loop = self._loop or asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(
             self.send_json({
                 "jsonrpc": "2.0",
