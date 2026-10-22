@@ -138,6 +138,54 @@ class SessionMoonpieMixin:
             "archived": bool(row["archived"]),
         }
 
+    def record_moonpie_exchange(
+        self, device_id: str, conversation_id: str, user_text: str, assistant_text: str,
+    ) -> None:
+        """Remember one exchange so the conversation can be restored later.
+
+        Creates the conversation row on first use (title: the first words of what the user said), appends the user and assistant
+        messages and refreshes the count and update time. Empty text is not stored.
+        """
+        if not conversation_id:
+            return
+        now = time.time()
+        pairs = [(role, text) for role, text in (("user", user_text), ("assistant", assistant_text)) if text and text.strip()]
+        if not pairs:
+            return
+        title = " ".join((user_text or assistant_text).split())[:60] or "New Conversation"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT device_id FROM moonpie_conversations WHERE id = ?", (conversation_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO moonpie_conversations (id, device_id, title, message_count, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 0, ?, ?)",
+                    (conversation_id, device_id, title, now, now),
+                )
+            elif row[0] != device_id:
+                return  # never write into another device's conversation
+            for role, text in pairs:
+                conn.execute(
+                    "INSERT INTO moonpie_messages (conversation_id, device_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (conversation_id, device_id, role, text, now),
+                )
+            conn.execute(
+                "UPDATE moonpie_conversations SET message_count = message_count + ?, updated_at = ? WHERE id = ?",
+                (len(pairs), now, conversation_id),
+            )
+
+        self._execute_write(_do)
+
+    def list_moonpie_messages(self, conversation_id: str, device_id: str) -> List[Dict[str, Any]]:
+        """The stored messages of one of *device_id*'s conversations, oldest first."""
+        rows = self._read_all(
+            "SELECT role, content, created_at FROM moonpie_messages WHERE conversation_id = ? AND device_id = ? ORDER BY id",
+            (conversation_id, device_id),
+        )
+        return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in rows]
+
     # ------------------------------------------------------------------
     # Jobs
     # ------------------------------------------------------------------

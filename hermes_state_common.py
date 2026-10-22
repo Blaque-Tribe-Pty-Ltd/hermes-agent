@@ -607,6 +607,18 @@ CREATE INDEX IF NOT EXISTS idx_moonpie_conv_device_updated
 CREATE INDEX IF NOT EXISTS idx_moonpie_conv_device_archived
     ON moonpie_conversations(device_id, archived, updated_at DESC);
 
+-- Text of each MoonPie exchange (what the user said and the final answer), so a device can restore conversations it no longer has.
+CREATE TABLE IF NOT EXISTS moonpie_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_moonpie_messages_conv
+    ON moonpie_messages(conversation_id, id);
+
 CREATE TABLE IF NOT EXISTS moonpie_jobs (
     id TEXT PRIMARY KEY,
     device_id TEXT NOT NULL,
