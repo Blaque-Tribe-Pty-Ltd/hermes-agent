@@ -741,6 +741,8 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     device_id=conn.device_id or "",
                     conversation_id=conversation_id,
                     session_key=conn.session_key,
+                    reasoning_level=params.get("reasoning_level"),
+                    permission_mode=params.get("permission_mode"),
                 )
 
                 # If the model didn't stream deltas, send one full delta now so the
@@ -760,6 +762,14 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                     "method": "conversation.complete",
                     "params": {"conversation_id": conversation_id},
                 })
+
+                usage = _moonpie_adapter.usage_snapshot(conn.device_id or "", conversation_id)
+                if usage:
+                    await conn.send_json({
+                        "jsonrpc": "2.0",
+                        "method": "usage",
+                        "params": {**usage, "conversation_id": conversation_id},
+                    })
 
                 # Provide a JSON-RPC result for request/response clients (ignored by MoonPie UI)
                 await conn.send_json({
@@ -878,6 +888,7 @@ async def _moonpie_loop(conn: _MoonPieConnection):
                 "result": {
                     "workspaces": [],
                     "bridge_available": False,
+                    **_moonpie_adapter.capabilities(),
                 },
             })
 

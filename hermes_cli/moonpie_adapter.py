@@ -76,8 +76,13 @@ class MoonPieHermesAdapter:
         device_id: str = "",
         conversation_id: str = "",
         session_key: str = "",
+        reasoning_level: str | None = None,
+        permission_mode: str | None = None,
     ) -> str:
         """Send text or multimodal *content* and stream deltas via *stream_callback*.
+
+        Optional *reasoning_level* (low/medium/high) and *permission_mode*
+        (ask/auto) apply to this turn only and are restored afterwards.
 
         Optional *tool_event_callback* receives normalized MoonPie tool lifecycle
         events: ``tool.started``, ``tool.completed``, ``tool.failed``.
@@ -120,18 +125,22 @@ class MoonPieHermesAdapter:
             # adapter boundary.
             from hermes_cli.web_routers._common import _config_profile_scope
 
-            with _config_profile_scope(None):
-                try:
-                    history = session_db.get_messages_as_conversation(agent.session_id)
-                except Exception as exc:
-                    raise RuntimeError("MoonPie session history is unavailable") from exc
-                result = agent.run_conversation(
-                    content,
-                    conversation_history=history,
-                    task_id=agent.session_id,
-                    stream_callback=_wrapped_stream,
-                )
-                return str(result.get("final_response") or "")
+            restore = self._apply_turn_options(agent, session_key, reasoning_level, permission_mode)
+            try:
+                with _config_profile_scope(None):
+                    try:
+                        history = session_db.get_messages_as_conversation(agent.session_id)
+                    except Exception as exc:
+                        raise RuntimeError("MoonPie session history is unavailable") from exc
+                    result = agent.run_conversation(
+                        content,
+                        conversation_history=history,
+                        task_id=agent.session_id,
+                        stream_callback=_wrapped_stream,
+                    )
+                    return str(result.get("final_response") or "")
+            finally:
+                restore()
 
         try:
             result = await asyncio.to_thread(_run)
@@ -142,6 +151,107 @@ class MoonPieHermesAdapter:
                 # Only remove if this is still the current turn for the device
                 if self._active_turns.get(device_id) is turn:
                     self._active_turns.pop(device_id, None)
+
+    # ------------------------------------------------------------------
+    # Composer capabilities, per-turn options and usage
+    # ------------------------------------------------------------------
+
+    REASONING_LEVELS = ("low", "medium", "high")
+    PERMISSION_MODES = ("ask", "auto")
+
+    def capabilities(self) -> dict:
+        """What MoonPie composers may offer. Keys are optional for clients; old clients ignore them."""
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            model_cfg = load_config_readonly().get("model", {})
+            model = model_cfg.get("default") if isinstance(model_cfg, dict) else None
+        except Exception:
+            model = None
+        models = [{"id": str(model), "label": str(model), "active": True}] if model else []
+        return {
+            "models": models,
+            "reasoning_levels": list(self.REASONING_LEVELS),
+            "default_reasoning_level": "medium",
+            "permission_modes": list(self.PERMISSION_MODES),
+            "default_permission_mode": "ask",
+            "usage": True,
+        }
+
+    def _apply_turn_options(self, agent: Any, session_key: str, reasoning_level, permission_mode):
+        """Apply per-turn options; return a callable that restores the previous state. Invalid values are ignored."""
+        restorers: list[Callable[[], None]] = []
+
+        if reasoning_level is not None:
+            if reasoning_level in self.REASONING_LEVELS:
+                from hermes_constants import parse_reasoning_effort
+
+                previous = getattr(agent, "reasoning_config", None)
+                agent.reasoning_config = parse_reasoning_effort(reasoning_level)
+                restorers.append(lambda: setattr(agent, "reasoning_config", previous))
+            else:
+                _log.warning("MoonPie: ignoring unknown reasoning_level %r", reasoning_level)
+
+        if permission_mode is not None:
+            if permission_mode in self.PERMISSION_MODES and session_key:
+                from tools.approval import (
+                    disable_session_yolo,
+                    enable_session_yolo,
+                    is_session_yolo_enabled,
+                )
+
+                was_auto = is_session_yolo_enabled(session_key)
+                if permission_mode == "auto":
+                    enable_session_yolo(session_key)
+                else:
+                    disable_session_yolo(session_key)
+
+                def _restore_permission() -> None:
+                    if was_auto:
+                        enable_session_yolo(session_key)
+                    else:
+                        disable_session_yolo(session_key)
+
+                restorers.append(_restore_permission)
+            else:
+                _log.warning("MoonPie: ignoring unknown permission_mode %r", permission_mode)
+
+        def restore() -> None:
+            for fn in reversed(restorers):
+                try:
+                    fn()
+                except Exception:  # restoring must never mask the turn's own result
+                    _log.warning("MoonPie: failed to restore a per-turn option", exc_info=True)
+
+        return restore
+
+    def usage_snapshot(self, device_id: str = "", conversation_id: str = "") -> dict | None:
+        """Token counters after a turn, or None when the agent exposes nothing usable."""
+        agent = self._agents.get(self._session_id(device_id, conversation_id)) if device_id and conversation_id else None
+        if agent is None:
+            return None
+        snapshot: dict[str, int] = {}
+
+        def _int(value: Any) -> int | None:
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+        for key, attrs in (
+            ("input_tokens", ("session_input_tokens", "session_prompt_tokens")),
+            ("output_tokens", ("session_output_tokens", "session_completion_tokens")),
+        ):
+            for attr in attrs:
+                value = _int(getattr(agent, attr, None))
+                if value:
+                    snapshot[key] = value
+                    break
+        engine = getattr(agent, "context_compressor", None)
+        window = _int(getattr(engine, "context_length", None)) if engine is not None else None
+        used = _int(getattr(engine, "last_prompt_tokens", None)) if engine is not None else None
+        if window:
+            snapshot["context_window"] = window
+        if used:
+            snapshot["context_used"] = used
+        return snapshot or None
 
     async def synthesize_speech(self, text: str) -> Optional[bytes]:
         """Synthesise speech for *text* and return the audio bytes.
