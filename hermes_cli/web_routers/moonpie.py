@@ -536,6 +536,10 @@ class _MoonPieConnection:
         except Exception:
             _log.warning("Failed to persist approval %s to SessionDB", approval_id, exc_info=True)
 
+        # An MCP tool consent is a per-call yes/no: the gateway remembers nothing for it, so offering
+        # "session" or "always" would promise something that does not happen.
+        actions = ["once", "deny"] if approval_data.get("pattern_key") == "mcp_elicitation" else ["once", "session", "always", "deny"]
+
         loop = asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(
             self.send_json({
@@ -545,7 +549,7 @@ class _MoonPieConnection:
                     "approval_id": approval_id,
                     "command": command,
                     "description": description,
-                    "actions": ["once", "session", "always", "deny"],
+                    "actions": actions,
                 },
             }),
             loop,
