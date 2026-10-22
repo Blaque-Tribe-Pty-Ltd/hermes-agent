@@ -501,6 +501,8 @@ class _MoonPieConnection:
         self.authenticated_at: Optional[float] = None
         # The loop that owns this socket. Approval notifications are raised from the agent's worker thread, which has
         # no event loop of its own, so asking for "the current loop" there fails (Python 3.12+) and every approval fails closed.
+        self.turn_tasks: set = set()
+        self.turn_tail: Optional[asyncio.Task] = None
         try:
             self._loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
         except RuntimeError:
@@ -593,6 +595,8 @@ async def moonpie_websocket(websocket: WebSocket):
         _log.info("MoonPie WebSocket disconnected: %s",
                   conn.device_id or "unauthenticated")
     finally:
+        for task in list(conn.turn_tasks):
+            task.cancel()
         if conn.device_id:
             _moonpie_connections.pop(conn.device_id, None)
             # Unregister from the gateway approval system so pending approvals
@@ -602,6 +606,185 @@ async def moonpie_websocket(websocket: WebSocket):
                 unregister_gateway_notify(conn.session_key)
             except Exception:
                 _log.debug("unregister_gateway_notify failed for %s", conn.device_id, exc_info=True)
+
+
+def _spawn_turn(conn: "_MoonPieConnection", turn) -> None:
+    """Run *turn* (a coroutine) as a task, after any earlier turn of this connection has finished.
+
+    Turns used to be awaited inside the receive loop, so while a turn waited for an approval the loop could not read the
+    answer (or a cancel) and the turn sat until the approval timed out. Chaining keeps turns on one connection sequential,
+    so two never overlap on the same device session.
+    """
+    previous = conn.turn_tail
+
+    async def runner() -> None:
+        if previous is not None:
+            await asyncio.wait([previous])
+        await turn
+
+    task = asyncio.ensure_future(runner())
+    conn.turn_tail = task
+    conn.turn_tasks.add(task)
+    task.add_done_callback(conn.turn_tasks.discard)
+
+
+async def _handle_conversation_message(conn: "_MoonPieConnection", params: dict, req_id: Any) -> None:
+    """One agent turn. Runs as its own task so the receive loop keeps reading frames (approval answers, cancel) meanwhile."""
+    payload = params.get("payload", {})
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        content = build_moonpie_message_content(
+            payload.get("text", params.get("content", "")),
+            payload.get("images", params.get("images", [])),
+        )
+    except ValueError as exc:
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32602, "message": str(exc)},
+        })
+        return
+    conversation_id = params.get("conversation_id", "")
+
+    loop = asyncio.get_running_loop()
+    accumulated = []
+
+    def stream_callback(delta: str):
+        accumulated.append(delta)
+        asyncio.run_coroutine_threadsafe(
+            conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "conversation.delta",
+                "params": {
+                    "content": delta,
+                    "conversation_id": conversation_id,
+                },
+            }),
+            loop,
+        )
+
+    session_tokens = []
+    tracker = _turn_jobs.start(
+        _get_moonpie_db(), conn.device_id or "", conversation_id,
+        payload.get("text", params.get("content", "")),
+    )
+
+    async def send_job_notes(notes: list) -> None:
+        # Same queue as the tool events (scheduled from the agent thread), so a closing note cannot overtake an earlier one.
+        for note in notes:
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(conn.send_json(note), loop))
+
+    try:
+        # Gate 5: Tool visibility — wire tool lifecycle events to the client.
+        def tool_event_callback(event_type: str, event_data: dict) -> None:
+            """Sync callback from the agent thread; bridge to async WebSocket."""
+            try:
+                job_notes = tracker.on_tool_event(event_type, event_data)
+            except Exception:
+                _log.warning("MoonPie job tracking failed", exc_info=True)
+                job_notes = []
+            for note in job_notes:
+                asyncio.run_coroutine_threadsafe(conn.send_json(note), loop)
+            asyncio.run_coroutine_threadsafe(
+                conn.send_json({
+                    "jsonrpc": "2.0",
+                    "method": event_type,
+                    "params": {
+                        **event_data,
+                        "conversation_id": conversation_id,
+                    },
+                }),
+                loop,
+            )
+
+        # Bind the gateway approval context so dangerous-command guards
+        # route approval requests to this MoonPie session.
+        session_tokens = set_session_vars(
+            platform="moonpie",
+            session_key=conn.session_key,
+            async_delivery=True,
+        )
+        set_current_session_key(conn.session_key)
+        final_response = await _moonpie_adapter.chat(
+            content,
+            stream_callback=stream_callback,
+            tool_event_callback=tool_event_callback,
+            device_id=conn.device_id or "",
+            conversation_id=conversation_id,
+            session_key=conn.session_key,
+            reasoning_level=params.get("reasoning_level"),
+            permission_mode=params.get("permission_mode"),
+        )
+        await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "done"))
+
+        # If the model didn't stream deltas, send one full delta now so the
+        # client has content to render before the complete notification.
+        if final_response and not accumulated:
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "conversation.delta",
+                "params": {
+                    "content": final_response,
+                    "conversation_id": conversation_id,
+                },
+            })
+
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "method": "conversation.complete",
+            "params": {"conversation_id": conversation_id},
+        })
+
+        usage = _moonpie_adapter.usage_snapshot(conn.device_id or "", conversation_id)
+        if usage:
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "usage",
+                "params": {**usage, "conversation_id": conversation_id},
+            })
+
+        # Provide a JSON-RPC result for request/response clients (ignored by MoonPie UI)
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"status": "complete", "content": final_response},
+        })
+
+        # Stream TTS audio as binary frames after text completes
+        audio = await _moonpie_adapter.synthesize_speech(final_response)
+        if audio:
+            await conn.websocket.send_bytes(audio)
+            await conn.send_json({
+                "jsonrpc": "2.0",
+                "method": "tts.status",
+                "params": {"available": True},
+            })
+
+    except RuntimeError as exc:
+        _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
+        await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The agent was not available"))
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32000, "message": "Agent not available"},
+        })
+    except Exception as exc:
+        _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
+        await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The turn failed"))
+        await conn.send_json({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32000, "message": str(exc)},
+        })
+    finally:
+        try:  # a turn ended some other way (e.g. the socket closed) must not leave its job running
+            await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The connection closed"))
+        except Exception:
+            _log.debug("MoonPie could not report a closed job", exc_info=True)
+        _turn_jobs.end(conn.device_id or "", conversation_id, tracker)
+        if session_tokens:
+            clear_session_vars(session_tokens)
 
 
 async def _moonpie_loop(conn: _MoonPieConnection):
@@ -700,161 +883,7 @@ async def _moonpie_loop(conn: _MoonPieConnection):
 
         # -- Protected operations (require authentication) ---------------------
         if method == "conversation.message":
-            payload = params.get("payload", {})
-            if not isinstance(payload, dict):
-                payload = {}
-            try:
-                content = build_moonpie_message_content(
-                    payload.get("text", params.get("content", "")),
-                    payload.get("images", params.get("images", [])),
-                )
-            except ValueError as exc:
-                await conn.send_json({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32602, "message": str(exc)},
-                })
-                continue
-            conversation_id = params.get("conversation_id", "")
-
-            loop = asyncio.get_running_loop()
-            accumulated = []
-
-            def stream_callback(delta: str):
-                accumulated.append(delta)
-                asyncio.run_coroutine_threadsafe(
-                    conn.send_json({
-                        "jsonrpc": "2.0",
-                        "method": "conversation.delta",
-                        "params": {
-                            "content": delta,
-                            "conversation_id": conversation_id,
-                        },
-                    }),
-                    loop,
-                )
-
-            session_tokens = []
-            tracker = _turn_jobs.start(
-                _get_moonpie_db(), conn.device_id or "", conversation_id,
-                payload.get("text", params.get("content", "")),
-            )
-
-            async def send_job_notes(notes: list) -> None:
-                # Same queue as the tool events (scheduled from the agent thread), so a closing note cannot overtake an earlier one.
-                for note in notes:
-                    await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(conn.send_json(note), loop))
-
-            try:
-                # Gate 5: Tool visibility — wire tool lifecycle events to the client.
-                def tool_event_callback(event_type: str, event_data: dict) -> None:
-                    """Sync callback from the agent thread; bridge to async WebSocket."""
-                    try:
-                        job_notes = tracker.on_tool_event(event_type, event_data)
-                    except Exception:
-                        _log.warning("MoonPie job tracking failed", exc_info=True)
-                        job_notes = []
-                    for note in job_notes:
-                        asyncio.run_coroutine_threadsafe(conn.send_json(note), loop)
-                    asyncio.run_coroutine_threadsafe(
-                        conn.send_json({
-                            "jsonrpc": "2.0",
-                            "method": event_type,
-                            "params": {
-                                **event_data,
-                                "conversation_id": conversation_id,
-                            },
-                        }),
-                        loop,
-                    )
-
-                # Bind the gateway approval context so dangerous-command guards
-                # route approval requests to this MoonPie session.
-                session_tokens = set_session_vars(
-                    platform="moonpie",
-                    session_key=conn.session_key,
-                    async_delivery=True,
-                )
-                set_current_session_key(conn.session_key)
-                final_response = await _moonpie_adapter.chat(
-                    content,
-                    stream_callback=stream_callback,
-                    tool_event_callback=tool_event_callback,
-                    device_id=conn.device_id or "",
-                    conversation_id=conversation_id,
-                    session_key=conn.session_key,
-                    reasoning_level=params.get("reasoning_level"),
-                    permission_mode=params.get("permission_mode"),
-                )
-                await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "done"))
-
-                # If the model didn't stream deltas, send one full delta now so the
-                # client has content to render before the complete notification.
-                if final_response and not accumulated:
-                    await conn.send_json({
-                        "jsonrpc": "2.0",
-                        "method": "conversation.delta",
-                        "params": {
-                            "content": final_response,
-                            "conversation_id": conversation_id,
-                        },
-                    })
-
-                await conn.send_json({
-                    "jsonrpc": "2.0",
-                    "method": "conversation.complete",
-                    "params": {"conversation_id": conversation_id},
-                })
-
-                usage = _moonpie_adapter.usage_snapshot(conn.device_id or "", conversation_id)
-                if usage:
-                    await conn.send_json({
-                        "jsonrpc": "2.0",
-                        "method": "usage",
-                        "params": {**usage, "conversation_id": conversation_id},
-                    })
-
-                # Provide a JSON-RPC result for request/response clients (ignored by MoonPie UI)
-                await conn.send_json({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {"status": "complete", "content": final_response},
-                })
-
-                # Stream TTS audio as binary frames after text completes
-                audio = await _moonpie_adapter.synthesize_speech(final_response)
-                if audio:
-                    await conn.websocket.send_bytes(audio)
-                    await conn.send_json({
-                        "jsonrpc": "2.0",
-                        "method": "tts.status",
-                        "params": {"available": True},
-                    })
-
-            except RuntimeError as exc:
-                _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
-                await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The agent was not available"))
-                await conn.send_json({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32000, "message": "Agent not available"},
-                })
-            except Exception as exc:
-                _log.error("MoonPie agent turn failed: %s", exc, exc_info=True)
-                await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The turn failed"))
-                await conn.send_json({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32000, "message": str(exc)},
-                })
-            finally:
-                try:  # a turn ended some other way (e.g. the socket closed) must not leave its job running
-                    await send_job_notes(tracker.finish("cancelled" if tracker.cancelled else "failed", "The connection closed"))
-                except Exception:
-                    _log.debug("MoonPie could not report a closed job", exc_info=True)
-                _turn_jobs.end(conn.device_id or "", conversation_id, tracker)
-                if session_tokens:
-                    clear_session_vars(session_tokens)
+            _spawn_turn(conn, _handle_conversation_message(conn, params, req_id))
 
         elif method == "conversation.cancel":
             conversation_id = params.get("conversation_id", "")
