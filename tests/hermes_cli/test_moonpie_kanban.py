@@ -157,3 +157,12 @@ def test_event_stream_replays_live_task_change(moonpie_client, token):
         event_message = websocket.receive_json()
         assert event_message["method"] == "kanban.events"
         assert event_message["params"]["events"]
+
+
+def test_kanban_routes_are_exempt_from_dashboard_cookie_gate_but_handler_authenticated():
+    from hermes_cli.dashboard_auth.middleware import _path_is_public
+    from hermes_cli.web_server import _is_handler_authenticated_api_path
+
+    path = "/api/moonpie/kanban/board"
+    assert _path_is_public(path)
+    assert _is_handler_authenticated_api_path(path)
