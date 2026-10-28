@@ -43,7 +43,8 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/assets/", "/favicon.ico", "/ds-assets/", "/fonts/", "/fonts-terminal/",
     # MoonPie native-client data routes authenticate device bearer tokens in
     # their handlers. Device management remains behind the operator gate.
-    "/api/moonpie/conversations/", "/api/moonpie/jobs/", "/api/moonpie/approvals/")
+    "/api/moonpie/conversations/", "/api/moonpie/jobs/", "/api/moonpie/approvals/",
+    "/api/moonpie/kanban/")
 
 
 def _path_is_public(path: str) -> bool:

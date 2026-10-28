@@ -1068,3 +1068,9 @@ register_global_provider(MoonPieDeviceProvider())
 register_token_route("/api/moonpie/conversations")
 register_token_route("/api/moonpie/jobs")
 register_token_route("/api/moonpie/approvals")
+
+# Reuse the canonical Kanban database and transition helpers while extending
+# MoonPie's already-paired device-authenticated API boundary.
+from hermes_cli.web_routers.moonpie_kanban import router as _moonpie_kanban_router
+
+router.include_router(_moonpie_kanban_router)

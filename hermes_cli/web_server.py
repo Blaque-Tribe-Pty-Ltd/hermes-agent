@@ -435,6 +435,7 @@ _HANDLER_AUTHENTICATED_API_PREFIXES: tuple[str, ...] = (
     "/api/moonpie/conversations",
     "/api/moonpie/jobs",
     "/api/moonpie/approvals",
+    "/api/moonpie/kanban",
 )
 
 
