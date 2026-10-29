@@ -107,6 +107,22 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert isinstance(new_id, int) and new_id >= 1
 
 
+def test_work_link_columns_are_added_to_existing_boards(tmp_path, monkeypatch):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("ALTER TABLE tasks DROP COLUMN conversation_id")
+        conn.execute("ALTER TABLE tasks DROP COLUMN job_id")
+
+    with kbc.connect_closing(db_path) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        assert {"conversation_id", "job_id"}.issubset(columns)
+        task_id = kb.create_task(conn, title="Migrated", conversation_id="conv-123", job_id="job-456")
+        task = kb.get_task(conn, task_id)
+        assert task.conversation_id == "conv-123"
+        assert task.job_id == "job-456"
+
+
 
 
 def test_migration_is_idempotent(tmp_path, monkeypatch):

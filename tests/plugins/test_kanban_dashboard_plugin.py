@@ -110,6 +110,33 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_task_work_links_round_trip_and_can_be_cleared(client):
+    created = client.post("/api/plugins/kanban/tasks", json={
+        "title": "Linked task", "conversation_id": "  conv-123  ", "job_id": "job-456",
+    })
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+    assert created.json()["task"]["conversation_id"] == "conv-123"
+    assert created.json()["task"]["job_id"] == "job-456"
+
+    updated = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"clear_job_id": True})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["task"]["conversation_id"] == "conv-123"
+    assert updated.json()["task"]["job_id"] is None
+
+    conflict = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={
+        "job_id": "job-789", "clear_job_id": True,
+    })
+    assert conflict.status_code == 400
+
+
+def test_task_work_link_rejects_blank_ids(client):
+    response = client.post("/api/plugins/kanban/tasks", json={
+        "title": "Bad link", "conversation_id": "   ",
+    })
+    assert response.status_code == 400
+
+
 def test_board_exposes_last_event_time_and_keeps_priority_order(client):
     low = client.post("/api/plugins/kanban/tasks", json={"title": "low", "priority": -2}).json()["task"]
     normal = client.post("/api/plugins/kanban/tasks", json={"title": "normal", "priority": 0}).json()["task"]

@@ -889,6 +889,13 @@ board was fetched again. Numeric priority uses larger values for greater urgency
 `0` is the default. Queue order is priority descending, then creation time
 ascending.
 
+Tasks may also carry optional opaque `conversation_id` and `job_id` values for
+clients that maintain work across services. `POST /tasks` accepts these fields;
+`PATCH /tasks/:id` can set them or clear them with `clear_conversation_id` and
+`clear_job_id`. They are returned by task and board reads. Existing rows stay
+unlinked during the additive schema migration; the API never guesses a link from
+task text, project, or assignee.
+
 ### Dashboard config
 
 Any of these keys under `dashboard.kanban` in `~/.hermes/config.yaml` changes the tab's defaults — the plugin reads them at load time via `GET /config`:
