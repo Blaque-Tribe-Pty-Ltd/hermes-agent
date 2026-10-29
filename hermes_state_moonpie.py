@@ -374,7 +374,7 @@ class SessionMoonpieMixin:
 
         where_clause = " AND ".join(conditions)
         sql = (
-            f"SELECT id, session_key, command, description, status, action, created_at, resolved_at "
+            f"SELECT id, session_key, command, description, status, action, reason, created_at, resolved_at "
             f"FROM moonpie_approvals WHERE {where_clause} "
             f"ORDER BY created_at DESC LIMIT ? OFFSET ?"
         )
@@ -389,6 +389,7 @@ class SessionMoonpieMixin:
                 "description": row["description"],
                 "status": row["status"],
                 "action": row["action"],
+                "reason": row["reason"],
                 "created_at": row["created_at"],
                 "resolved_at": row["resolved_at"],
             }
@@ -419,19 +420,19 @@ class SessionMoonpieMixin:
         return aid
 
     def resolve_moonpie_approval(
-        self, approval_id: str, status: str, action: Optional[str] = None,
+        self, approval_id: str, status: str, action: Optional[str] = None, reason: Optional[str] = None,
     ) -> int:
         """Mark an approval as resolved. Returns rows affected (0 or 1)."""
         now = time.time()
         return self._write_rowcount(
-            "UPDATE moonpie_approvals SET status = ?, action = ?, resolved_at = ? WHERE id = ?",
-            (status, action, now, approval_id),
+            "UPDATE moonpie_approvals SET status = ?, action = ?, reason = ?, resolved_at = ? WHERE id = ?",
+            (status, action, reason, now, approval_id),
         )
 
     def get_moonpie_approval(self, approval_id: str, device_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single approval if it belongs to *device_id*."""
         row = self._read_one(
-            "SELECT id, session_key, command, description, status, action, created_at, resolved_at "
+            "SELECT id, session_key, command, description, status, action, reason, created_at, resolved_at "
             "FROM moonpie_approvals WHERE id = ? AND device_id = ?",
             (approval_id, device_id),
         )
@@ -444,6 +445,7 @@ class SessionMoonpieMixin:
             "description": row["description"],
             "status": row["status"],
             "action": row["action"],
+            "reason": row["reason"],
             "created_at": row["created_at"],
             "resolved_at": row["resolved_at"],
         }
