@@ -318,9 +318,26 @@ def get_board(
         # One window-function query for latest summaries (avoids N+1); cards get a
         # truncated preview, the full text comes from /tasks/:id.
         summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        latest_updates: dict[str, int] = {}
+        task_ids = [task.id for task in tasks]
+        for offset in range(0, len(task_ids), 500):
+            task_id_batch = task_ids[offset:offset + 500]
+            placeholders = _placeholders(task_id_batch)
+            latest_updates.update({
+                row["task_id"]: int(row["updated_at"])
+                for row in conn.execute(
+                    f"SELECT task_id, MAX(created_at) AS updated_at FROM task_events "
+                    f"WHERE task_id IN ({placeholders}) GROUP BY task_id",
+                    tuple(task_id_batch),
+                ).fetchall()
+            })
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None))
+            # Task edits and transitions are append-only task_events. Expose
+            # their latest timestamp as the task's last-change time without a
+            # destructive schema migration of existing boards.
+            d["updated_at"] = max(t.created_at, latest_updates.get(t.id, t.created_at))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -335,6 +352,7 @@ def get_board(
         columns["done"].sort(key=lambda d: (d["completed_at"] is None, -(d["completed_at"] or 0)))
 
         # Queue columns keep list_tasks' dispatch order (priority DESC, created_at ASC).
+        # Larger numeric values are more urgent; 0 is the default priority.
         tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
         assignees = [r["assignee"] for r in conn.execute(
             "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL AND status != 'archived' ORDER BY assignee")]
