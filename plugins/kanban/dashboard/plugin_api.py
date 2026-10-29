@@ -168,11 +168,20 @@ def _errors_to_500(prefix: str) -> Iterator[None]:
 # sync with kanban_db.VALID_STATUSES — a status missing here gets mis-bucketed into ``todo``.
 BOARD_COLUMNS: list[str] = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
 
+# Older board data used ``completed`` for tasks that now belong in ``done``.
+# Normalize at the API boundary so reads stay compatible without rewriting history.
+_LEGACY_TASK_STATUS_ALIASES = {"completed": "done"}
+
+
+def _canonical_task_status(status: str) -> str:
+    return _LEGACY_TASK_STATUS_ALIASES.get(status, status)
+
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
 def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None) -> dict[str, Any]:
     d = asdict(task)
+    d["status"] = _canonical_task_status(task.status)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
         d["age"] = kanban_db.task_age(task)
@@ -270,7 +279,7 @@ def _link_tasks(conn: sqlite3.Connection, links: dict[str, list[str]]) -> list[d
     for task_id in dict.fromkeys([*links["parents"], *links["children"]]):
         task = kanban_db.get_task(conn, task_id)
         if task:
-            rows.append({"id": task.id, "title": task.title, "status": task.status})
+            rows.append({"id": task.id, "title": task.title, "status": _canonical_task_status(task.status)})
     return rows
 
 
@@ -316,7 +325,8 @@ def get_board(
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
             _attach_diagnostics(d, diagnostics_per_task.get(t.id))
-            columns[t.status if t.status in columns else "todo"].append(d)
+            status = _canonical_task_status(t.status)
+            columns[status if status in columns else "todo"].append(d)
 
         # Queue lanes keep the list_tasks dispatch order; the done column is
         # history, so order it newest-completed-first. Two stable sorts compose
@@ -382,7 +392,7 @@ def get_task(
             "links": links,
             "link_tasks": _link_tasks(conn, links),
             "child_results": [
-                {"id": c.id, "title": c.title, "status": c.status, "latest_summary": child_summaries.get(c.id), "result": c.result}
+                {"id": c.id, "title": c.title, "status": _canonical_task_status(c.status), "latest_summary": child_summaries.get(c.id), "result": c.result}
                 for c in children],
             "runs": [asdict(r) for r in kanban_db.list_runs(conn, task_id, state_type=run_state_type, state_name=run_state_name)]}
 

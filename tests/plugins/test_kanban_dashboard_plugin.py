@@ -154,6 +154,35 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     assert any(t["id"] == task["id"] for t in columns["scheduled"])
     assert not any(t["id"] == task["id"] for t in columns["todo"])
 
+
+def test_legacy_completed_tasks_are_exposed_as_done(client):
+    """Legacy completed records belong in the done column in current clients."""
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "legacy completed review", "assignee": "reviewer"},
+    ).json()["task"]
+
+    conn = kbc.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'completed', completed_at = ? WHERE id = ?",
+                (time.time(), task["id"]),
+            )
+    finally:
+        conn.close()
+
+    response = client.get("/api/plugins/kanban/board")
+    assert response.status_code == 200, response.text
+    columns = {column["name"]: column["tasks"] for column in response.json()["columns"]}
+    done_task = next(item for item in columns["done"] if item["id"] == task["id"])
+    assert done_task["status"] == "done"
+    assert not any(item["id"] == task["id"] for item in columns["todo"])
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["task"]["status"] == "done"
+
 def test_tenant_filter(client):
     client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
     client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})
