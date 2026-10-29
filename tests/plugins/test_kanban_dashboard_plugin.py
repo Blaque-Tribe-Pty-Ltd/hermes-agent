@@ -109,6 +109,41 @@ def test_create_task_appears_on_board(client):
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
 
+
+def test_board_exposes_last_event_time_and_keeps_priority_order(client):
+    low = client.post("/api/plugins/kanban/tasks", json={"title": "low", "priority": -2}).json()["task"]
+    normal = client.post("/api/plugins/kanban/tasks", json={"title": "normal", "priority": 0}).json()["task"]
+    high = client.post("/api/plugins/kanban/tasks", json={"title": "high", "priority": 2}).json()["task"]
+
+    edited = client.patch(f"/api/plugins/kanban/tasks/{high['id']}", json={"title": "high edited"})
+    assert edited.status_code == 200, edited.text
+
+    # Give the creation and edit events distinct, deterministic times.
+    event_time = high["created_at"] + 10
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            event_ids = [
+                row["id"] for row in conn.execute(
+                    "SELECT id FROM task_events WHERE task_id = ? ORDER BY id ASC", (high["id"],)
+                ).fetchall()
+            ]
+            assert len(event_ids) >= 2
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE id = ?",
+                (event_time, event_ids[0]),
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE id = ?",
+                (event_time + 20, event_ids[-1]),
+            )
+
+    columns = {column["name"]: column["tasks"] for column in client.get("/api/plugins/kanban/board").json()["columns"]}
+    ready = columns["ready"]
+    assert [task["id"] for task in ready] == [high["id"], normal["id"], low["id"]]
+    high_on_board = ready[0]
+    assert high_on_board["priority"] > normal["priority"] == 0 > low["priority"]
+    assert high_on_board["updated_at"] == event_time + 20
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

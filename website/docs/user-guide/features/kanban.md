@@ -881,6 +881,14 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 
 Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
 
+The board response includes an `updated_at` timestamp for each task, derived from
+the newest `task_events.created_at` row for that task (falling back to the task's
+`created_at` when it has no events). Clients can use it to identify recently
+changed work without treating an old task as newly updated merely because the
+board was fetched again. Numeric priority uses larger values for greater urgency;
+`0` is the default. Queue order is priority descending, then creation time
+ascending.
+
 ### Dashboard config
 
 Any of these keys under `dashboard.kanban` in `~/.hermes/config.yaml` changes the tab's defaults — the plugin reads them at load time via `GET /config`:
