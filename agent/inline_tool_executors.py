@@ -232,6 +232,15 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
 
 
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
+def _moonpie_app_action(agent, args: dict, ctx: InlineToolContext) -> Any:
+    callback = getattr(agent, "moonpie_app_action_callback", None)
+    if getattr(agent, "platform", None) != "moonpie" or not callable(callback):
+        return json.dumps({"outcome": "unavailable", "reason": "No authenticated MoonPie client is attached."})
+    if not isinstance(args, dict) or set(args) != {"action", "arguments"} or not isinstance(args.get("arguments"), dict):
+        return json.dumps({"outcome": "invalid_request"})
+    return callback(args)
+
+
 INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
@@ -277,6 +286,7 @@ INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
     "manage_catalog": _manage_catalog,
     "setup_mcp": _setup_mcp_shim,
     "delegate_task": lambda agent, args, ctx: agent._dispatch_delegate_task(args),
+    "moonpie_app_action": _moonpie_app_action,
 }
 
 # ``invoke_tool`` (concurrent path) consults the memory manager right after these three

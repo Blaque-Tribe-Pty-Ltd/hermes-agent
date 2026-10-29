@@ -33,6 +33,40 @@ _log = logging.getLogger("hermes_cli.moonpie_adapter")
 # How long a new conversation agent waits for MCP servers to connect before its tool snapshot is taken.
 _MCP_DISCOVERY_WAIT_SECONDS = 25.0
 
+_MOONPIE_APP_ACTION_SCHEMA = {
+ "type": "function",
+ "function": {"name": "moonpie_app_action",
+  "description": "Navigate or inspect MoonPie, or request a governed app change. Client confirmation is required for changes. Report only the exact verified client outcome.",
+  "parameters": {"type": "object", "properties": {
+   "action": {"type": "string", "enum": ["navigate_to_section","open_panel","open_task_by_id","open_task_by_title","open_notification_by_id","open_approval_by_id","open_system_status","open_gateway_diagnostics","refresh_or_reconnect_data","acknowledge_notification","approve_request","reject_request","update_task"]},
+   "arguments": {"type": "object", "additionalProperties": False, "properties": {
+    "section": {"type":"string","enum":["home","conversations","projects","tasks","approvals","knowledge","notifications","system"]},
+    "panel": {"type":"string","enum":["tasks","approvals","notifications","system","gateway_diagnostics"]},
+    "task_id":{"type":"string","maxLength":160},"notification_id":{"type":"string","maxLength":160},"approval_id":{"type":"string","maxLength":160},
+    "title":{"type":"string","maxLength":240},"source":{"type":"string","enum":["kanban","notifications","approvals","gateway"]},
+    "changes":{"type":"object","additionalProperties":False,"properties":{"title":{"type":"string","maxLength":240},"body":{"type":"string","maxLength":12000},"assignee":{"type":"string","maxLength":160},"priority":{"type":"integer","minimum":-10,"maximum":10},"status":{"type":"string","maxLength":80}},"minProperties":1}
+   }}},
+   "required":["action","arguments"],"additionalProperties":False
+  }
+ }
+}
+
+def _enable_moonpie_app_action(agent, callback):
+    if getattr(agent, "platform", None) != "moonpie":
+        return
+    agent.moonpie_app_action_callback = callback
+    names = set(getattr(agent, "valid_tool_names", None) or ())
+    if "moonpie_app_action" in names:
+        return
+    if getattr(agent, "_cached_system_prompt", None) is not None:
+        _log.warning(
+            "MoonPie action tool was not installed because the session prompt is already cached"
+        )
+        return
+    agent.tools = list(getattr(agent, "tools", None) or []) + [_MOONPIE_APP_ACTION_SCHEMA]
+    agent.valid_tool_names = names | {"moonpie_app_action"}
+
+
 
 class _TurnState:
     """Per-device turn state for cancellation tracking (Gate 6, B5)."""
@@ -84,6 +118,7 @@ class MoonPieHermesAdapter:
         session_key: str = "",
         reasoning_level: str | None = None,
         permission_mode: str | None = None,
+        app_action_callback: Callable[[dict], str] | None = None,
     ) -> str:
         """Send text or multimodal *content* and stream deltas via *stream_callback*.
 
@@ -112,9 +147,12 @@ class MoonPieHermesAdapter:
             device_id=device_id,
             conversation_id=conversation_id,
             tool_event_callback=tool_event_callback,
+            app_action_callback=app_action_callback,
         )
         if agent is None:
             raise RuntimeError("Agent not available")
+        if app_action_callback is not None:
+            _enable_moonpie_app_action(agent, app_action_callback)
 
         # Register turn for cancellation tracking
         turn = _TurnState(device_id, conversation_id, session_key)
@@ -387,6 +425,7 @@ class MoonPieHermesAdapter:
         device_id: str,
         conversation_id: str,
         tool_event_callback: Callable[[str, dict], None] | None = None,
+        app_action_callback: Callable[[dict], str] | None = None,
     ) -> Optional[Any]:
         """Lazily initialise the Hermes agent bound to one MoonPie conversation."""
         agent = self._agents.get(session_id)
@@ -470,6 +509,8 @@ class MoonPieHermesAdapter:
                         )
 
                 agent = await asyncio.to_thread(_init)
+                if app_action_callback is not None:
+                    _enable_moonpie_app_action(agent, app_action_callback)
                 self._agents[session_id] = agent
                 if tool_event_callback is not None:
                     self._wire_tool_callbacks(agent, tool_event_callback,
