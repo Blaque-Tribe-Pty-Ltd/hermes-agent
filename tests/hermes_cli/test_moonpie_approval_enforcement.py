@@ -187,6 +187,24 @@ class TestRestApprovalEndpoints:
         assert response.status_code == 200
         assert entry.result == "weird-choice"
 
+    def test_respond_approval_passes_reason_to_waiting_agent(self, client, valid_token):
+        session_key = "moonpie_moonpie-test-device"
+        entry = wait_mod._ApprovalEntry({"request_id": "req-reason", "command": "tool", "description": "write"})
+        approval_mod._gateway_queues[session_key] = [entry]
+        response = client.post(
+            "/api/moonpie/approvals/req-reason/respond",
+            headers={"Authorization": f"Bearer {valid_token}"},
+            json={"action": "deny", "reason": "Please keep the change inside the approved folder."},
+        )
+        assert response.status_code == 200
+        assert entry.result == "deny"
+        assert entry.reason == "Please keep the change inside the approved folder."
+
+    def test_approval_reason_is_normalized_and_bounded(self):
+        assert moonpie_router._normalize_approval_reason("  revise the path  ") == "revise the path"
+        assert moonpie_router._normalize_approval_reason("  ") is None
+        assert len(moonpie_router._normalize_approval_reason("x" * 2100)) == 2000
+
 
 # ---------------------------------------------------------------------------
 # WebSocket approval routing tests
@@ -217,11 +235,32 @@ class TestWebSocketApprovalRouting:
             ws.send_json({
                 "jsonrpc": "2.0", "id": 2,
                 "method": "approval.respond",
-                "params": {"approval_id": "req-ws-001", "action": "once"},
+                "params": {"approval_id": "req-ws-001", "action": "deny", "reason": "Please explain the target first."},
             })
             msg = json.loads(ws.receive_text())
             assert msg["result"]["status"] == "resolved"
-            assert entry.result == "once"
+            assert entry.result == "deny"
+            assert entry.reason == "Please explain the target first."
+
+    def test_list_approvals_includes_persisted_audit_fields(self, client, valid_token, device_token_store):
+        approval_id = device_token_store.create_moonpie_approval(
+            device_id="moonpie-test-device", session_key="moonpie_moonpie-test-device",
+            command="swift build", description="Build the project", approval_id="req-audit",
+        )
+        device_token_store.resolve_moonpie_approval(
+            approval_id, status="resolved", action="deny", reason="Need a narrower change.",
+        )
+        response = client.get(
+            "/api/moonpie/approvals?limit=100",
+            headers={"Authorization": f"Bearer {valid_token}"},
+        )
+        assert response.status_code == 200
+        record = next(row for row in response.json() if row["approval_id"] == approval_id)
+        assert record["status"] == "resolved"
+        assert record["action"] == "deny"
+        assert record["reason"] == "Need a narrower change."
+        assert record["created_at"] > 0
+        assert record["resolved_at"] >= record["created_at"]
 
     def test_approval_respond_not_found_when_no_pending(self, client, valid_token):
         """approval.respond for a missing approval returns error."""

@@ -138,10 +138,22 @@ class ApprovalSummary(BaseModel):
     command: str
     description: str
     status: str
+    action: Optional[str] = None
+    reason: Optional[str] = None
+    created_at: Optional[float] = None
+    resolved_at: Optional[float] = None
 
 
 class ApprovalRespondRequest(BaseModel):
     action: str  # "approve", "reject", "view_diff"
+    reason: Optional[str] = Field(default=None, max_length=2000)
+
+
+def _normalize_approval_reason(reason: Optional[str]) -> Optional[str]:
+    if not isinstance(reason, str):
+        return None
+    normalized = reason.strip()[:2000]
+    return normalized or None
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +478,18 @@ async def list_approvals(
     _log.debug("list_approvals for %s", device_id)
     db = _get_moonpie_db()
     rows = db.list_moonpie_approvals(device_id, limit=limit, offset=offset, status=status)
+    from gateway.run import _redact_approval_command
+
     return [
         ApprovalSummary(
             approval_id=r["id"],
-            command=r["command"],
+            command=_redact_approval_command(r["command"]),
             description=r["description"],
             status=r["status"],
+            action=r["action"],
+            reason=r["reason"],
+            created_at=r["created_at"],
+            resolved_at=r["resolved_at"],
         )
         for r in rows
     ]
@@ -482,14 +500,15 @@ async def respond_approval(approval_id: str, req: ApprovalRespondRequest, author
     device_id = _authenticate_device(authorization)
     session_key = _approval_session_key(device_id)
     _log.info("MoonPie approval response: %s action=%s from %s", approval_id, req.action, device_id)
-    resolved = resolve_gateway_approval(session_key, req.action, request_id=approval_id)
+    reason = _normalize_approval_reason(req.reason)
+    resolved = resolve_gateway_approval(session_key, req.action, reason=reason, request_id=approval_id)
     if resolved == 0:
         raise HTTPException(status_code=404, detail="Approval not found or already resolved")
 
     # Persist the resolution so list_approvals reflects the outcome.
     try:
         db = _get_moonpie_db()
-        db.resolve_moonpie_approval(approval_id, status="resolved", action=req.action)
+        db.resolve_moonpie_approval(approval_id, status="resolved", action=req.action, reason=reason)
     except Exception:
         _log.warning("Failed to persist approval resolution %s to SessionDB", approval_id, exc_info=True)
 
@@ -1136,14 +1155,15 @@ async def _moonpie_loop(conn: _MoonPieConnection):
         elif method == "approval.respond":
             approval_id = params.get("approval_id", "")
             action = params.get("action", "")
+            reason = _normalize_approval_reason(params.get("reason"))
             _log.info("MoonPie approval response: %s action=%s from %s", approval_id, action, conn.device_id)
-            resolved = resolve_gateway_approval(conn.session_key, action, request_id=approval_id)
+            resolved = resolve_gateway_approval(conn.session_key, action, reason=reason, request_id=approval_id)
 
             # Persist the resolution so list_approvals reflects the outcome.
             if resolved:
                 try:
                     db = _get_moonpie_db()
-                    db.resolve_moonpie_approval(approval_id, status="resolved", action=action)
+                    db.resolve_moonpie_approval(approval_id, status="resolved", action=action, reason=reason)
                 except Exception:
                     _log.warning("Failed to persist WS approval resolution %s to SessionDB", approval_id, exc_info=True)
 

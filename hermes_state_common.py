@@ -643,6 +643,7 @@ CREATE TABLE IF NOT EXISTS moonpie_approvals (
     description TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     action TEXT,
+    reason TEXT,
     created_at REAL NOT NULL,
     resolved_at REAL
 );
